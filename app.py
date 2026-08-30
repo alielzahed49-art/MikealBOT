@@ -73,6 +73,9 @@ LOG_KEEP = _int("LOG_KEEP", 400)
 GROUP_SPREAD_MIN = _int("GROUP_SPREAD_MIN", 15)
 GROUP_SPREAD_MAX = _int("GROUP_SPREAD_MAX", 90)
 
+# أقصى وقت نسيب فيه شارة "بيسافر" ظاهرة من غير تأكيد وصول
+TRAVEL_TIMEOUT_MINUTES = _int("TRAVEL_TIMEOUT_MINUTES", 60)
+
 APP_NAME = os.environ.get("APP_NAME", "لوحة ميكائيل")
 
 PERKS = {
@@ -212,6 +215,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     diamonds      TEXT NOT NULL DEFAULT '—',
     location      TEXT NOT NULL DEFAULT '',
     nation        TEXT NOT NULL DEFAULT '',
+    travel_destination TEXT NOT NULL DEFAULT '',
+    travel_sent_at      TIMESTAMPTZ,
     lv_barracks   TEXT NOT NULL DEFAULT '?',
     lv_war        TEXT NOT NULL DEFAULT '?',
     lv_scientist  TEXT NOT NULL DEFAULT '?',
@@ -248,6 +253,12 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);
 """
 
+# لو القاعدة كانت شغّالة من قبل بعمود أقل، الأسطر دي بتضيف الجديد من غير ما تلمس بياناتك
+MIGRATIONS = [
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS travel_destination TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS travel_sent_at TIMESTAMPTZ",
+]
+
 
 def init_db(force=False):
     """آمن نناديها كتير — بتشتغل فعلياً مرة واحدة بس بعد أول نجاح."""
@@ -257,6 +268,8 @@ def init_db(force=False):
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
+            for stmt in MIGRATIONS:
+                cur.execute(stmt)
     _schema_ready = True
     log.info("قاعدة البيانات جاهزة")
 
@@ -360,7 +373,7 @@ class GameClient:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": "ar,ar-SA;q=0.9,en-US;q=0.8,en;q=0.7",
             "User-Agent": self.user_agent,
             "Origin": GAME_ORIGIN,
             "Referer": f"{GAME_ORIGIN}/",
@@ -619,12 +632,21 @@ def _parse_time(value):
 # ── منفّذو المهام ────────────────────────────────────────
 def task_refresh(account, payload):
     data = parse_profile(client_for(account).profile())
+
+    # لو الموقع الجديد بقى هو نفسه الوجهة اللي كان مسافر ليها، يبقى وصل
+    clear_travel = (
+        account.get("travel_destination")
+        and data["location"]
+        and data["location"].strip().lower() == account["travel_destination"].strip().lower()
+    )
+    extra_sets = ", travel_destination='', travel_sent_at=NULL" if clear_travel else ""
+
     db_execute(
-        """UPDATE accounts SET
+        f"""UPDATE accounts SET
              game_name=%s, level_num=%s, xp_pct=%s, balance=%s, diamonds=%s,
              location=%s, nation=%s, lv_barracks=%s, lv_war=%s,
              lv_scientist=%s, lv_supply=%s,
-             status='ok', last_error='', last_seen=NOW()
+             status='ok', last_error='', last_seen=NOW(){extra_sets}
            WHERE id=%s""",
         (data["game_name"], data["level_num"], data["xp_pct"], data["balance"],
          data["diamonds"], data["location"], data["nation"], data["lv_barracks"],
@@ -637,8 +659,10 @@ def task_travel(account, payload):
     if not destination:
         raise GameError("مفيش وجهة محددة")
     client_for(account).travel(destination)
-    db_execute("UPDATE accounts SET location=%s WHERE id=%s", (destination, account["id"]))
-    return f"سافر إلى {destination}"
+    db_execute(
+        "UPDATE accounts SET travel_destination=%s, travel_sent_at=NOW() WHERE id=%s",
+        (destination, account["id"]))
+    return f"طلب السفر إلى {destination} اترسل"
 
 
 def task_visa(account, payload):
@@ -840,6 +864,14 @@ def schedule_periodic():
             if (work_until is None or work_until <= now()) and _queue_if_free(aid, "work"):
                 added += 1
 
+    # لو عدّت ساعة من غير ما نتأكد إن الحساب وصل، بنشيل شارة "بيسافر" —
+    # يمكن اللعبة رفضت السفر أو الرحلة خلصت وإحنا فاتنا التحديث اللي أكّد كده
+    stale_travel = now() - timedelta(minutes=TRAVEL_TIMEOUT_MINUTES)
+    db_execute(
+        "UPDATE accounts SET travel_destination='', travel_sent_at=NULL "
+        "WHERE travel_sent_at IS NOT NULL AND travel_sent_at < %s",
+        (stale_travel,))
+
     return added
 
 
@@ -983,6 +1015,8 @@ select.field{cursor:pointer}
 .pick{width:19px;height:19px;accent-color:var(--red);cursor:pointer;flex-shrink:0;margin-top:4px}
 .err-line{margin-top:9px;font-size:12px;color:var(--red-bright);background:var(--red-dim);
   border-right:2px solid var(--red);padding:6px 9px;border-radius:0 var(--r-sm) var(--r-sm) 0}
+.travel-badge{margin-top:9px;font-size:12px;color:var(--sand);background:rgba(217,164,65,.12);
+  border-right:2px solid var(--sand);padding:6px 9px;border-radius:0 var(--r-sm) var(--r-sm) 0}
 
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft);
   border-radius:var(--r-sm);overflow:hidden;margin:12px 0 10px}
@@ -1220,6 +1254,7 @@ function cardHtml(a) {
     </div>
 
     ${a.last_error ? `<div class="err-line">${esc(a.last_error)}</div>` : ''}
+    ${a.travel ? `<div class="travel-badge">🚀 مسافر إلى ${esc(a.travel.destination)}${travelElapsed(a.travel.sent_at)}</div>` : ''}
 
     <div class="stats">
       <div class="stat">
@@ -1279,6 +1314,14 @@ function cardHtml(a) {
       <button class="btn btn-sm btn-danger" onclick="removeAccount(${a.id})">حذف</button>
     </div>
   </div>`;
+}
+
+function travelElapsed(sentAt) {
+  if (!sentAt) return '';
+  const mins = Math.max(0, Math.round((Date.now() - new Date(sentAt).getTime()) / 60000));
+  if (mins < 1) return ' (لسه دلوقتي)';
+  if (mins < 60) return ` (من ${mins} دقيقة)`;
+  return ` (من ${Math.round(mins / 60)} ساعة)`;
 }
 
 function togglePick(id, on) {
@@ -1460,19 +1503,27 @@ function renderCountries() {
 
   $('tr-list').innerHTML = list.map((c) => {
     const open = state.expandedCountry === c.country_name;
-    const provinces = term
+    const matchesCountryName = term && c.country_name.toLowerCase().includes(term);
+    // لو البحث طابق اسم الدولة نفسها، نعرض كل مناطقها — مش بس اللي فيها نفس الحروف
+    const provinces = (term && !matchesCountryName)
       ? c.provinces.filter((p) => p.name.toLowerCase().includes(term))
       : c.provinces;
+    const shouldShow = open || matchesCountryName || (term && provinces.length > 0 && !matchesCountryName);
 
-    const rows = (open || term) ? provinces.map((p) => `
+    const rows = shouldShow ? provinces.map((p) => `
       <div class="province" style="padding-inline-start:26px;display:flex;align-items:center;gap:8px">
-        <span style="flex:1">${p.is_capital ? '⭐ ' : ''}${esc(p.name)}</span>
+        <span style="flex:1">${p.icon ? p.icon + ' ' : ''}${p.is_capital ? '⭐ ' : ''}${esc(p.name)}</span>
         <button class="btn btn-sm btn-go" onclick="event.stopPropagation();travelTo('${esc(p.name).replace(/'/g, "\\'")}')">سفر</button>
       </div>`).join('') : '';
+
+    const flag = c.flag_url
+      ? `<img src="${esc(c.flag_url)}" alt="" style="width:20px;height:14px;object-fit:cover;border-radius:2px;flex-shrink:0">`
+      : '';
 
     return `
       <div class="province" style="display:flex;align-items:center;gap:8px;font-weight:600"
            onclick="toggleCountry('${esc(c.country_name).replace(/'/g, "\\'")}')">
+        ${flag}
         <span style="flex:1">${esc(c.country_name)} <span style="color:var(--muted);font-weight:400">(${c.provinces.length})</span></span>
         <button class="btn btn-sm" onclick="event.stopPropagation();applyVisa('${c.country_id || ''}','${esc(c.country_name).replace(/'/g, "\\'")}')">طلب فيزا</button>
         <button class="btn btn-sm" onclick="event.stopPropagation();applyResidence('${c.country_id || ''}','${esc(c.country_name).replace(/'/g, "\\'")}')">طلب إقامة</button>
@@ -1881,6 +1932,10 @@ def _public_account(row):
         "xp_pct": row["xp_pct"], "balance": row["balance"],
         "diamonds": row["diamonds"], "location": row["location"],
         "nation": row["nation"],
+        "travel": {
+            "destination": row["travel_destination"],
+            "sent_at": row["travel_sent_at"].isoformat() if row["travel_sent_at"] else None,
+        } if row["travel_destination"] else None,
         "skills": {
             "barracks": row["lv_barracks"], "war_techniques": row["lv_war"],
             "scientist": row["lv_scientist"], "supply_drill": row["lv_supply"],
@@ -2161,6 +2216,7 @@ def api_countries():
         by_country[key]["provinces"].append({
             "name": pname, "region": p.get("region", ""),
             "is_capital": bool(p.get("is_capital")),
+            "icon": p.get("icon") or "",
         })
 
     countries = sorted(by_country.values(), key=lambda c: c["country_name"])
