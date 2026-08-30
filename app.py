@@ -319,6 +319,25 @@ def build_proxies(account):
     return {"http": url, "https": url}
 
 
+def parse_proxy_line(text):
+    """
+    بيفهم البروكسي من سطر واحد بالشكل: عنوان:منفذ:يوزر:باسورد
+    (يوزر وباسورد اختياريين). بيرجع dict فيه host/port/user/pass أو None لو الصيغة غلط.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}
+    parts = text.split(":")
+    if len(parts) < 2:
+        raise ValueError("الصيغة لازم تكون عنوان:منفذ أو عنوان:منفذ:يوزر:باسورد")
+    host, port = parts[0].strip(), parts[1].strip()
+    if not host or not port.isdigit():
+        raise ValueError("العنوان أو المنفذ غلط — المنفذ لازم يكون رقم")
+    user = parts[2].strip() if len(parts) > 2 else ""
+    pwd = ":".join(parts[3:]).strip() if len(parts) > 3 else ""
+    return {"proxy_host": host, "proxy_port": port, "proxy_user": user, "proxy_pass": pwd}
+
+
 def _message_of(body):
     if not isinstance(body, dict):
         return ""
@@ -385,6 +404,34 @@ class GameClient:
     def provinces(self):
         data = self.get("/provinces/all")
         return data.get("provinces", []) if isinstance(data, dict) else []
+
+    def countries(self):
+        data = self.get("/countries/leaderboard/countries")
+        return data.get("countries", []) if isinstance(data, dict) else []
+
+    def apply_visa(self, country_id):
+        """POST /visas/apply {country_id} — طلب فيزا لدولة."""
+        status, body = self.post("/visas/apply", {"country_id": country_id})
+        if status in (200, 201) and body.get("success", True):
+            return body
+        raise GameError(_message_of(body) or f"طلب الفيزا اترفض ({status})")
+
+    def apply_residence(self, country_id):
+        """
+        POST /residencies/apply {country_id} — طلب إقامة.
+        ملحوظة: المسار ده متبني على قياس طلب الفيزا (نفس الشكل بالظبط) لأننا
+        ملقيناش الطلب الحقيقي في الشبكة. لو رجّع 404 كده يبقى المسار غلط —
+        راجع ملاحظة "طلب الإقامة" في الشرح تحت.
+        """
+        status, body = self.post("/residencies/apply", {"country_id": country_id})
+        if status in (200, 201) and body.get("success", True):
+            return body
+        if status == 404:
+            raise GameError(
+                "مسار طلب الإقامة في اللعبة مختلف عن اللي متوقّع — "
+                "لازم تتأكد منه من الشبكة (Network) وتبعتهولي أظبطه"
+            )
+        raise GameError(_message_of(body) or f"طلب الإقامة اترفض ({status})")
 
     def travel(self, destination):
         status, body = self.post("/provinces/travel/start", {"destination": destination})
@@ -594,6 +641,24 @@ def task_travel(account, payload):
     return f"سافر إلى {destination}"
 
 
+def task_visa(account, payload):
+    country_id = payload.get("country_id")
+    country_name = payload.get("country_name", "")
+    if not country_id:
+        raise GameError("مفيش دولة محددة")
+    client_for(account).apply_visa(country_id)
+    return f"طلب فيزا لـ {country_name}" if country_name else "طلب الفيزا اترسل"
+
+
+def task_residence(account, payload):
+    country_id = payload.get("country_id")
+    country_name = payload.get("country_name", "")
+    if not country_id:
+        raise GameError("مفيش دولة محددة")
+    client_for(account).apply_residence(country_id)
+    return f"طلب إقامة لـ {country_name}" if country_name else "طلب الإقامة اترسل"
+
+
 def task_upgrade(account, payload):
     perk = payload.get("perk") or account["perk"]
     currency = payload.get("currency") or account["currency"]
@@ -661,6 +726,8 @@ def task_work(account, payload):
 HANDLERS = {
     "refresh": task_refresh,
     "travel": task_travel,
+    "visa": task_visa,
+    "residence": task_residence,
     "upgrade": task_upgrade,
     "auto_upgrade": task_auto_upgrade,
     "quests": task_quests,
@@ -669,8 +736,8 @@ HANDLERS = {
 }
 
 KIND_LABELS = {
-    "refresh": "تحديث", "travel": "سفر", "upgrade": "ترقية",
-    "auto_upgrade": "تطوير تلقائي", "quests": "مهام يومية",
+    "refresh": "تحديث", "travel": "سفر", "visa": "طلب فيزا", "residence": "طلب إقامة",
+    "upgrade": "ترقية", "auto_upgrade": "تطوير تلقائي", "quests": "مهام يومية",
     "wheel": "عجلة", "work": "شغل",
 }
 
@@ -1028,7 +1095,7 @@ const STAR = '<polygon points="50,5 76.4,86.4 7.2,36.1 92.8,36.1 23.6,86.4"/>';
 const state = {
   accounts: [], logs: [], squads: [],
   selected: new Set(), squadFilter: '',
-  provinces: [], pickedProvince: null,
+  countries: [], expandedCountry: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1133,7 +1200,7 @@ function cardHtml(a) {
     </label>`;
 
   const proxyText = a.proxy.configured
-    ? `${esc(a.proxy.host)}:${esc(a.proxy.port)}${a.proxy.note ? ' — ' + esc(a.proxy.note) : ''}`
+    ? `${esc(a.proxy.line_masked)}${a.proxy.note ? ' — ' + esc(a.proxy.note) : ''}`
     : 'مفيش بروكسي — الطلبات هتخرج من السيرفر مباشرة';
 
   return `
@@ -1301,30 +1368,30 @@ async function saveAccount() {
   } catch (e) { toast(e.message, true); }
 }
 
-function openProxyModal(id) {
+async function openProxyModal(id) {
   const a = state.accounts.find((x) => x.id === id);
   if (!a) return;
   $('px-id').value = id;
   $('px-type').value = a.proxy.type || 'http';
-  $('px-host').value = a.proxy.host || '';
-  $('px-port').value = a.proxy.port || '';
-  $('px-user').value = a.proxy.user || '';
-  $('px-pass').value = '';
   $('px-note').value = a.proxy.note || '';
+  $('px-line').value = '…جاري التحميل';
   openModal('modal-proxy');
+  try {
+    const r = await api(`/api/accounts/${id}/proxy`);
+    $('px-line').value = r.line || '';
+  } catch (e) {
+    $('px-line').value = '';
+    toast(e.message, true);
+  }
 }
 
 async function saveProxy() {
   const id = $('px-id').value;
   const payload = {
     proxy_type: $('px-type').value,
-    proxy_host: $('px-host').value.trim(),
-    proxy_port: $('px-port').value.trim(),
-    proxy_user: $('px-user').value.trim(),
+    proxy_line: $('px-line').value.trim(),
     proxy_note: $('px-note').value.trim(),
   };
-  const pass = $('px-pass').value;
-  if (pass) payload.proxy_pass = pass;
   try {
     await api(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
     toast('البروكسي اتحفظ');
@@ -1350,57 +1417,90 @@ async function testProxy() {
 }
 
 async function openTravelModal() {
-  state.pickedProvince = null;
+  state.expandedCountry = null;
   $('tr-search').value = '';
-  $('tr-go').disabled = true;
   openModal('modal-travel');
-  if (state.provinces.length) return renderProvinces();
+  if (state.countries.length) return renderCountries();
 
-  $('tr-hint').textContent = 'بنجيب قايمة المناطق من اللعبة…';
+  $('tr-hint').textContent = 'بنجيب قايمة الدول من اللعبة…';
   try {
-    const r = await api('/api/provinces');
-    state.provinces = r.provinces;
-    $('tr-hint').textContent = `${r.provinces.length} منطقة متاحة`;
-    renderProvinces();
+    const r = await api('/api/countries');
+    state.countries = r.countries;
+    $('tr-hint').textContent = `${r.countries.length} دولة متاحة`;
+    renderCountries();
   } catch (e) {
     $('tr-hint').textContent = e.message;
     $('tr-list').innerHTML =
-      '<div class="province" style="color:var(--muted)">مقدرناش نجيب القايمة — اكتب اسم المنطقة بنفسك تحت.</div>' +
-      '<div style="padding:10px"><input class="field" id="tr-manual" placeholder="اسم المنطقة بالظبط زي ما هي في اللعبة" style="width:100%"></div>';
-    const manual = $('tr-manual');
-    if (manual) {
-      manual.addEventListener('input', () => {
-        state.pickedProvince = manual.value.trim() || null;
-        $('tr-go').disabled = !state.pickedProvince;
-      });
-    }
+      '<div class="province" style="color:var(--muted)">مقدرناش نجيب القايمة — اكتب اسم المنطقة بنفسك واعمل سفر مباشر.</div>' +
+      '<div style="padding:10px;display:flex;gap:6px">' +
+      '<input class="field" id="tr-manual" placeholder="اسم المنطقة بالظبط زي ما هي في اللعبة" style="flex:1">' +
+      '<button class="btn btn-go btn-sm" onclick="manualTravel()">سفر</button></div>';
   }
 }
 
-function renderProvinces() {
+function manualTravel() {
+  const name = ($('tr-manual')?.value || '').trim();
+  if (!name) return;
+  runGroup('travel', { destination: name }, $('tr-spread').checked);
+  closeModals();
+}
+
+function renderCountries() {
   const term = ($('tr-search').value || '').trim().toLowerCase();
-  const list = state.provinces
-    .filter((p) => !term || p.name.toLowerCase().includes(term))
-    .slice(0, 120);
+  const list = state.countries.filter((c) => {
+    if (!term) return true;
+    if (c.country_name.toLowerCase().includes(term)) return true;
+    return c.provinces.some((p) => p.name.toLowerCase().includes(term));
+  });
+
   if (!list.length) {
     $('tr-list').innerHTML = '<div class="province" style="color:var(--muted)">مفيش نتيجة</div>';
     return;
   }
-  $('tr-list').innerHTML = list.map((p) => `
-    <div class="province ${state.pickedProvince === p.name ? 'picked' : ''}"
-         onclick="pickProvince('${esc(p.name).replace(/'/g, "\\'")}')">${esc(p.name)}</div>
-  `).join('');
+
+  $('tr-list').innerHTML = list.map((c) => {
+    const open = state.expandedCountry === c.country_name;
+    const provinces = term
+      ? c.provinces.filter((p) => p.name.toLowerCase().includes(term))
+      : c.provinces;
+
+    const rows = (open || term) ? provinces.map((p) => `
+      <div class="province" style="padding-inline-start:26px;display:flex;align-items:center;gap:8px">
+        <span style="flex:1">${p.is_capital ? '⭐ ' : ''}${esc(p.name)}</span>
+        <button class="btn btn-sm btn-go" onclick="event.stopPropagation();travelTo('${esc(p.name).replace(/'/g, "\\'")}')">سفر</button>
+      </div>`).join('') : '';
+
+    return `
+      <div class="province" style="display:flex;align-items:center;gap:8px;font-weight:600"
+           onclick="toggleCountry('${esc(c.country_name).replace(/'/g, "\\'")}')">
+        <span style="flex:1">${esc(c.country_name)} <span style="color:var(--muted);font-weight:400">(${c.provinces.length})</span></span>
+        <button class="btn btn-sm" onclick="event.stopPropagation();applyVisa('${c.country_id || ''}','${esc(c.country_name).replace(/'/g, "\\'")}')">طلب فيزا</button>
+        <button class="btn btn-sm" onclick="event.stopPropagation();applyResidence('${c.country_id || ''}','${esc(c.country_name).replace(/'/g, "\\'")}')">طلب إقامة</button>
+      </div>
+      ${rows}
+    `;
+  }).join('');
 }
 
-function pickProvince(name) {
-  state.pickedProvince = name;
-  $('tr-go').disabled = false;
-  renderProvinces();
+function toggleCountry(name) {
+  state.expandedCountry = state.expandedCountry === name ? null : name;
+  renderCountries();
 }
 
-async function startTravel() {
-  if (!state.pickedProvince) return;
-  await runGroup('travel', { destination: state.pickedProvince }, $('tr-spread').checked);
+function travelTo(name) {
+  runGroup('travel', { destination: name }, $('tr-spread').checked);
+  closeModals();
+}
+
+function applyVisa(countryId, countryName) {
+  if (!countryId) return toast('الدولة دي من غير رقم تعريف — مش هينفع نطلب فيزا ليها', true);
+  runGroup('visa', { country_id: countryId, country_name: countryName }, $('tr-spread').checked);
+  closeModals();
+}
+
+function applyResidence(countryId, countryName) {
+  if (!countryId) return toast('الدولة دي من غير رقم تعريف — مش هينفع نطلب إقامة ليها', true);
+  runGroup('residence', { country_id: countryId, country_name: countryName }, $('tr-spread').checked);
   closeModals();
 }
 
@@ -1428,8 +1528,7 @@ function bind() {
   $('acc-save').onclick = saveAccount;
   $('px-save').onclick = saveProxy;
   $('px-test').onclick = testProxy;
-  $('tr-go').onclick = startTravel;
-  $('tr-search').oninput = renderProvinces;
+  $('tr-search').oninput = renderCountries;
 
   $('btn-travel').onclick = openTravelModal;
   $('btn-upgrade').onclick = () => runGroup('upgrade');
@@ -1545,7 +1644,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <button class="btn btn-sm" id="btn-select-none">إلغاء الاختيار</button>
       <span class="command-count" id="pick-count">مفيش اختيار</span>
       <div class="topbar-spacer"></div>
-      <button class="btn btn-go btn-sm" id="btn-travel" disabled>سفر جماعي</button>
+      <button class="btn btn-go btn-sm" id="btn-travel" disabled>الدول والسفر</button>
       <button class="btn btn-sm" id="btn-upgrade" disabled>ترقية</button>
       <button class="btn btn-sm" id="btn-autoupgrade" disabled>تطوير تلقائي</button>
       <button class="btn btn-sm" id="btn-refresh" disabled>تحديث البيانات</button>
@@ -1602,33 +1701,22 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="modal-head"><h3>بروكسي الحساب</h3></div>
     <div class="modal-body">
       <input type="hidden" id="px-id">
-      <div class="form-grid">
-        <div class="form-row">
-          <label for="px-type">النوع</label>
-          <select class="field" id="px-type">
-            <option value="http">HTTP</option>
-            <option value="https">HTTPS</option>
-            <option value="socks5">SOCKS5</option>
-            <option value="socks5h">SOCKS5H</option>
-          </select>
-        </div>
-        <div class="form-row">
-          <label for="px-port">المنفذ</label>
-          <input class="field" id="px-port" inputmode="numeric" placeholder="8080">
-        </div>
+      <div class="form-row">
+        <label for="px-type">النوع</label>
+        <select class="field" id="px-type" style="width:100%">
+          <option value="http">HTTP</option>
+          <option value="https">HTTPS</option>
+          <option value="socks5">SOCKS5</option>
+          <option value="socks5h">SOCKS5H</option>
+        </select>
       </div>
       <div class="form-row">
-        <label for="px-host">العنوان</label>
-        <input class="field" id="px-host" placeholder="proxy.example.com" dir="ltr">
-      </div>
-      <div class="form-grid">
-        <div class="form-row">
-          <label for="px-user">المستخدم</label>
-          <input class="field" id="px-user" dir="ltr">
-        </div>
-        <div class="form-row">
-          <label for="px-pass">كلمة السر</label>
-          <input class="field" id="px-pass" type="password" dir="ltr" placeholder="سيبها فاضية لو مش هتتغيّر">
+        <label for="px-line">بيانات البروكسي</label>
+        <input class="field" id="px-line" dir="ltr"
+               placeholder="عنوان:منفذ:يوزر:باسورد">
+        <div class="hint">
+          الصق السطر زي ما هو، مثال: <code dir="ltr">108.165.3.251:5382:ozyytuow:0tdkwosbhga2</code><br>
+          لو مفيش يوزر وباسورد، اكتب العنوان والمنفذ بس.
         </div>
       </div>
       <div class="form-row">
@@ -1646,24 +1734,23 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <div class="overlay" id="modal-travel">
   <div class="modal">
-    <div class="modal-head"><h3>سفر جماعي</h3></div>
+    <div class="modal-head"><h3>الدول والمناطق</h3></div>
     <div class="modal-body">
       <div class="form-row">
-        <label for="tr-search">المنطقة</label>
-        <input class="field" id="tr-search" placeholder="اكتب اسم المنطقة للبحث…">
-        <div class="hint" id="tr-hint">بنجيب قايمة المناطق من اللعبة…</div>
+        <label for="tr-search">دوّر على دولة أو منطقة</label>
+        <input class="field" id="tr-search" placeholder="اكتب اسم الدولة أو المنطقة…">
+        <div class="hint" id="tr-hint">بنجيب قايمة الدول من اللعبة…</div>
       </div>
-      <div class="province-list" id="tr-list"></div>
+      <div class="province-list" id="tr-list" style="max-height:340px"></div>
       <div class="form-row" style="margin-top:14px">
         <label class="toggle" style="width:100%">
           <input type="checkbox" id="tr-spread" checked>
-          <span>وزّع السفر على وقت بدل ما الكل يتحرّك في نفس اللحظة</span>
+          <span>وزّع الأوامر على وقت بدل ما الكل يتحرّك في نفس اللحظة</span>
         </label>
       </div>
     </div>
     <div class="modal-foot">
-      <button class="btn btn-go" id="tr-go" disabled>ابدأ السفر</button>
-      <button class="btn btn-ghost" data-close>إلغاء</button>
+      <button class="btn btn-ghost" data-close>إغلاق</button>
     </div>
   </div>
 </div>
@@ -1784,9 +1871,10 @@ def _public_account(row):
         "auto_upgrade": row["auto_upgrade"], "auto_quests": row["auto_quests"],
         "auto_wheel": row["auto_wheel"], "auto_work": row["auto_work"],
         "proxy": {
-            "type": row["proxy_type"], "host": row["proxy_host"],
-            "port": row["proxy_port"], "user": row["proxy_user"],
-            "note": row["proxy_note"],
+            "type": row["proxy_type"], "note": row["proxy_note"],
+            "line_masked": (f"{row['proxy_host']}:{row['proxy_port']}"
+                           f"{':' + row['proxy_user'] + ':••••••' if row['proxy_user'] else ''}")
+                           if row["proxy_host"] else "",
             "configured": bool(row["proxy_host"] and row["proxy_port"]),
         },
         "game_name": row["game_name"], "level_num": row["level_num"],
@@ -1826,8 +1914,7 @@ def api_state():
 
 
 # ── إدارة الحسابات ───────────────────────────────────────
-_EDITABLE_TEXT = {"label", "token", "squad", "perk", "currency", "proxy_type",
-                  "proxy_host", "proxy_port", "proxy_user", "proxy_pass", "proxy_note"}
+_EDITABLE_TEXT = {"label", "token", "squad", "perk", "currency", "proxy_type", "proxy_note"}
 _EDITABLE_BOOL = {"enabled", "auto_upgrade", "auto_quests", "auto_wheel", "auto_work"}
 
 
@@ -1875,6 +1962,21 @@ def api_update_account(account_id):
             sets.append(f"{field}=%s")
             params.append(bool(data.get(field)))
 
+    # البروكسي بيتبعت كسطر واحد "عنوان:منفذ:يوزر:باسورد" ونفكّه هنا
+    if "proxy_line" in data:
+        raw = (data.get("proxy_line") or "").strip()
+        if not raw:
+            sets += ["proxy_host=%s", "proxy_port=%s", "proxy_user=%s", "proxy_pass=%s"]
+            params += ["", "", "", ""]
+        else:
+            try:
+                parsed = parse_proxy_line(raw)
+            except ValueError as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
+            sets += ["proxy_host=%s", "proxy_port=%s", "proxy_user=%s", "proxy_pass=%s"]
+            params += [parsed["proxy_host"], parsed["proxy_port"],
+                      parsed["proxy_user"], parsed["proxy_pass"]]
+
     if not sets:
         return jsonify({"ok": False, "error": "مفيش حاجة تتغيّر"}), 400
 
@@ -1900,6 +2002,22 @@ def api_delete_account(account_id):
     db_execute("DELETE FROM accounts WHERE id=%s", (account_id,))
     add_log(f"اتمسح حساب: {account_title(account)}", "warn")
     return jsonify({"ok": True})
+
+
+@app.route("/api/accounts/<int:account_id>/proxy")
+@login_required
+def api_get_proxy(account_id):
+    """بترجع البروكسي كامل (من غير إخفاء) — تتستخدم بس وقت فتح نافذة التعديل."""
+    account = get_account(account_id)
+    if not account:
+        return jsonify({"ok": False, "error": "الحساب مش موجود"}), 404
+    line = ""
+    if account["proxy_host"]:
+        line = f"{account['proxy_host']}:{account['proxy_port']}"
+        if account["proxy_user"]:
+            line += f":{account['proxy_user']}:{account['proxy_pass']}"
+    return jsonify({"ok": True, "line": line, "type": account["proxy_type"],
+                    "note": account["proxy_note"]})
 
 
 @app.route("/api/accounts/<int:account_id>/proxy/test", methods=["POST"])
@@ -1973,22 +2091,30 @@ def api_command():
 
 
 _provinces_cache = {"data": None, "at": 0}
+_countries_cache = {"data": None, "at": 0}
+
+
+def _fetch_provinces_raw():
+    cached = _provinces_cache.get("data")
+    if cached and time.time() - _provinces_cache["at"] < 3600:
+        return cached, True
+    account = db_one("SELECT * FROM accounts WHERE token<>'' ORDER BY sort_order LIMIT 1")
+    if not account:
+        raise GameError("محتاج حساب واحد على الأقل بتوكن")
+    raw = client_for(account).provinces()
+    _provinces_cache["data"] = raw
+    _provinces_cache["at"] = time.time()
+    return raw, False
 
 
 @app.route("/api/provinces")
 @login_required
 def api_provinces():
-    """قايمة مناطق اللعبة — بنجيبها بأول حساب فيه توكن وبنكاشها في الذاكرة."""
-    cached = _provinces_cache.get("data")
-    if cached and time.time() - _provinces_cache["at"] < 3600:
-        return jsonify({"ok": True, "provinces": cached, "cached": True})
-
-    account = db_one("SELECT * FROM accounts WHERE token<>'' ORDER BY sort_order LIMIT 1")
-    if not account:
-        return jsonify({"ok": False, "error": "محتاج حساب واحد على الأقل بتوكن"}), 400
-
+    """قايمة مناطق اللعبة المسطّحة — بنجيبها بأول حساب فيه توكن وبنكاشها في الذاكرة."""
     try:
-        raw = client_for(account).provinces()
+        raw, cached = _fetch_provinces_raw()
+    except GameError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": f"مقدرناش نجيب المناطق — {e}"}), 502
 
@@ -2000,10 +2126,48 @@ def api_provinces():
             name = p.get("name") or p.get("title") or p.get("id")
             if name:
                 provinces.append({"id": p.get("id", name), "name": name})
+    return jsonify({"ok": True, "provinces": provinces, "cached": cached})
 
-    _provinces_cache["data"] = provinces
-    _provinces_cache["at"] = time.time()
-    return jsonify({"ok": True, "provinces": provinces, "cached": False})
+
+@app.route("/api/countries")
+@login_required
+def api_countries():
+    """
+    قايمة الدول وتحتها مناطقها — مبنية من بيانات المناطق نفسها (كل منطقة معاها
+    country_id و country_name)، فمحتاجناش نداء تاني منفصل للدول.
+    """
+    try:
+        raw, cached = _fetch_provinces_raw()
+    except GameError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"مقدرناش نجيب الدول — {e}"}), 502
+
+    by_country = {}
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        cid = p.get("country_id")
+        cname = p.get("country_name") or "بدون دولة"
+        pname = p.get("name")
+        if not pname:
+            continue
+        key = cid or cname
+        if key not in by_country:
+            by_country[key] = {
+                "country_id": cid, "country_name": cname,
+                "flag_url": p.get("country_flag", ""), "provinces": [],
+            }
+        by_country[key]["provinces"].append({
+            "name": pname, "region": p.get("region", ""),
+            "is_capital": bool(p.get("is_capital")),
+        })
+
+    countries = sorted(by_country.values(), key=lambda c: c["country_name"])
+    for c in countries:
+        c["provinces"].sort(key=lambda p: (not p["is_capital"], p["name"]))
+
+    return jsonify({"ok": True, "countries": countries, "cached": cached})
 
 
 @app.route("/api/tick", methods=["POST"])
