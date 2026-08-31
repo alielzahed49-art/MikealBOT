@@ -787,16 +787,6 @@ def task_residence(account, payload):
     return f"طلب إقامة لـ {country_name}" if country_name else "طلب الإقامة اترسل"
 
 
-def task_upgrade(account, payload):
-    perk = payload.get("perk") or account["perk"]
-    currency = payload.get("currency") or account["currency"]
-    skill_key = PERK_KEYS.get(perk)
-    if not skill_key:
-        raise GameError(f"مهارة غير معروفة: {perk}")
-    client_for(account).upgrade_skill(skill_key, currency)
-    return f"ترقية {PERKS[perk]['label']} بدأت"
-
-
 def task_auto_upgrade(account, payload):
     """التطوير التلقائي بتاع اللعبة نفسها — بيشتغل ٢٤ ساعة وبنجدّده لوحدنا."""
     perk = payload.get("perk") or account["perk"]
@@ -932,7 +922,7 @@ def task_plan_step(account, payload):
     perk = step["perk"]
     count = step["count"]
     done_before = plan.get("done_in_step", 0)
-    currency = plan.get("currency", "money")
+    currency = step.get("currency", "money")
     skill_key = PERK_KEYS.get(perk)
     label = PERKS.get(perk, {}).get("label", perk)
     client = client_for(account)
@@ -977,7 +967,6 @@ HANDLERS = {
     "travel": task_travel,
     "visa": task_visa,
     "residence": task_residence,
-    "upgrade": task_upgrade,
     "auto_upgrade": task_auto_upgrade,
     "quests": task_quests,
     "wheel": task_wheel,
@@ -989,7 +978,7 @@ HANDLERS = {
 
 KIND_LABELS = {
     "refresh": "تحديث", "travel": "سفر", "visa": "طلب فيزا", "residence": "طلب إقامة",
-    "upgrade": "ترقية", "auto_upgrade": "تطوير تلقائي", "quests": "مهام يومية",
+    "auto_upgrade": "تطوير تلقائي", "quests": "مهام يومية",
     "wheel": "عجلة", "work": "شغل", "pills_auto": "تحويل حبوب تلقائي",
     "military_auto": "انضمام عسكري", "plan_step": "خطوة من خطة تطوير",
 }
@@ -1385,7 +1374,6 @@ const state = {
   selected: new Set(), squadFilter: '',
   countries: [], expandedCountry: null,
   planSteps: [],
-  queueTasks: [], queueSelected: new Set(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1437,7 +1425,7 @@ function renderChips(s) {
     <span class="chip">الحسابات <b>${s.total}</b></span>
     <span class="chip on">شغّال <b>${s.running}</b></span>
     ${s.errors ? `<span class="chip bad">أخطاء <b>${s.errors}</b></span>` : ''}
-    ${s.pending_tasks ? `<span class="chip wait" style="cursor:pointer" onclick="openQueueModal()">في الطابور <b>${s.pending_tasks}</b></span>` : ''}
+    ${s.pending_tasks ? `<span class="chip wait">في الطابور <b>${s.pending_tasks}</b></span>` : ''}
   `;
 }
 
@@ -1519,7 +1507,8 @@ function cardHtml(a) {
     ${a.travel ? `<div class="travel-badge">🚀 مسافر إلى ${esc(a.travel.destination)}${travelElapsed(a.travel.sent_at)}</div>` : ''}
     ${a.upgrade_plan ? `<div class="plan-badge">
       <span class="txt">📋 خطة تطوير: خطوة ${a.upgrade_plan.step_index}/${a.upgrade_plan.total_steps} —
-      ${esc(a.upgrade_plan.current_label)} (${a.upgrade_plan.done_in_step}/${a.upgrade_plan.step_count}) ·
+      ${esc(a.upgrade_plan.current_label)} بـ${esc(a.upgrade_plan.current_currency)}
+      (${a.upgrade_plan.done_in_step}/${a.upgrade_plan.step_count}) ·
       باقي ${a.upgrade_plan.total_remaining} إجمالاً</span>
       <button class="btn btn-sm btn-ghost" onclick="cancelPlan(${a.id})">إلغاء</button>
     </div>` : ''}
@@ -1615,7 +1604,7 @@ function togglePick(id, on) {
 function renderPickState() {
   const n = state.selected.size;
   $('pick-count').textContent = n ? `${n} مختار` : 'مفيش اختيار';
-  ['btn-travel', 'btn-upgrade', 'btn-autoupgrade', 'btn-refresh', 'btn-plan']
+  ['btn-travel', 'btn-autoupgrade', 'btn-refresh', 'btn-plan']
     .forEach((id) => { $(id).disabled = n === 0; });
 }
 
@@ -1750,105 +1739,13 @@ async function testProxy() {
   }
 }
 
-async function openQueueModal() {
-  state.queueSelected = new Set();
-  openModal('modal-queue');
-  $('queue-list').innerHTML = '<div class="province" style="color:var(--muted)">بنجيب الطابور…</div>';
-  await loadQueue();
-}
-
-async function loadQueue() {
-  try {
-    const r = await api('/api/tasks');
-    state.queueTasks = r.tasks;
-    renderQueue();
-  } catch (e) {
-    $('queue-list').innerHTML = `<div class="province" style="color:var(--red-bright)">${esc(e.message)}</div>`;
-  }
-}
-
-function queueRelative(iso) {
-  const diffMs = new Date(iso).getTime() - Date.now();
-  const mins = Math.round(diffMs / 60000);
-  if (mins <= 0) return 'دلوقتي تقريباً';
-  if (mins < 60) return `بعد ${mins} دقيقة`;
-  return `بعد ${Math.round(mins / 60)} ساعة`;
-}
-
-function renderQueue() {
-  const list = state.queueTasks || [];
-  $('queue-count').textContent = `${list.length} مهمة`;
-
-  if (!list.length) {
-    $('queue-list').innerHTML = '<div class="province" style="color:var(--muted)">الطابور فاضي</div>';
-    return;
-  }
-
-  $('queue-list').innerHTML = list.map((t) => `
-    <div class="province" style="display:flex;align-items:center;gap:8px">
-      <input type="checkbox" class="pick" style="margin:0" ${state.queueSelected.has(t.id) ? 'checked' : ''}
-             onchange="toggleQueuePick(${t.id}, this.checked)">
-      <div style="flex:1;min-width:0">
-        <div style="font-size:13px">${esc(t.kind_label)}</div>
-        <div style="font-size:11px;color:var(--muted)">${esc(t.account_label)} · ${queueRelative(t.run_at)}</div>
-      </div>
-      <button class="btn btn-sm btn-danger" onclick="cancelOneQueue(${t.id})">إلغاء</button>
-    </div>`).join('');
-}
-
-function toggleQueuePick(id, on) {
-  if (on) state.queueSelected.add(id); else state.queueSelected.delete(id);
-}
-
-function selectAllQueue() {
-  state.queueSelected = new Set((state.queueTasks || []).map((t) => t.id));
-  renderQueue();
-}
-
-function selectNoneQueue() {
-  state.queueSelected = new Set();
-  renderQueue();
-}
-
-async function cancelOneQueue(id) {
-  try {
-    await api(`/api/tasks/${id}`, { method: 'DELETE' });
-    state.queueSelected.delete(id);
-    await loadQueue();
-    await loadState();
-  } catch (e) { toast(e.message, true); }
-}
-
-async function cancelSelectedQueue() {
-  const ids = [...state.queueSelected];
-  if (!ids.length) return toast('اختار مهمة واحدة على الأقل', true);
-  try {
-    const r = await api('/api/tasks/cancel', { method: 'POST', body: JSON.stringify({ ids }) });
-    toast(`اتلغى ${r.cancelled} مهمة`);
-    state.queueSelected = new Set();
-    await loadQueue();
-    await loadState();
-  } catch (e) { toast(e.message, true); }
-}
-
-async function cancelAllQueue() {
-  if (!confirm('تلغي الطابور كله؟')) return;
-  try {
-    const r = await api('/api/tasks/cancel', { method: 'POST', body: JSON.stringify({ all: true }) });
-    toast(`اتلغى ${r.cancelled} مهمة`);
-    state.queueSelected = new Set();
-    await loadQueue();
-    await loadState();
-  } catch (e) { toast(e.message, true); }
-}
-
 function openPlanModal() {
   if (!state.selected.size) return toast('اختار حسابات الأول', true);
   state.planSteps = [];
-  $('plan-currency').innerHTML = Object.entries(window.CURRENCIES)
-    .map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('');
   $('plan-perk').innerHTML = Object.entries(window.PERKS)
     .map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join('');
+  $('plan-step-currency').innerHTML = Object.entries(window.CURRENCIES)
+    .map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('');
   $('plan-count').value = '';
   renderPlanSteps();
   openModal('modal-plan');
@@ -1856,11 +1753,13 @@ function openPlanModal() {
 
 function addPlanStep() {
   const perk = $('plan-perk').value;
+  const currency = $('plan-step-currency').value;
   const count = parseInt($('plan-count').value, 10);
   if (!count || count <= 0) return toast('اكتب عدد أكبر من صفر', true);
   if (count > 300) return toast('أقصى عدد للخطوة الواحدة 300', true);
   const label = window.PERKS[perk]?.label || perk;
-  state.planSteps.push({ perk, count, label });
+  const currencyLabel = window.CURRENCIES[currency] || currency;
+  state.planSteps.push({ perk, count, currency, label, currencyLabel });
   $('plan-count').value = '';
   renderPlanSteps();
 }
@@ -1877,20 +1776,61 @@ function movePlanStep(idx, dir) {
   renderPlanSteps();
 }
 
+// بيقرا الرقم الحالي المستقر من نص زي "9" أو "9←10" (بيتجاهل اللي لسه pending)
+function currentSkillLevel(account, perk) {
+  const raw = account?.skills?.[perk];
+  const n = parseInt(String(raw ?? '').split('←')[0], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 function renderPlanSteps() {
   const list = state.planSteps;
+  const note = $('plan-preview-note');
+
   if (!list.length) {
     $('plan-steps').innerHTML = '<div class="province" style="color:var(--muted)">لسه مفيش خطوات — ضيف واحدة فوق</div>';
+    note.style.display = 'none';
     return;
   }
-  $('plan-steps').innerHTML = list.map((s, i) => `
+
+  const selectedIds = [...state.selected];
+  const singleAccount = selectedIds.length === 1
+    ? state.accounts.find((a) => a.id === selectedIds[0]) : null;
+
+  if (singleAccount) {
+    note.style.display = 'block';
+    note.textContent = `التوقع محسوب من مستوى "${singleAccount.label}" الحالي.`;
+  } else if (selectedIds.length > 1) {
+    note.style.display = 'block';
+    note.textContent = 'اخترت أكتر من حساب، ومستوياتهم ممكن تختلف — التوقع مش هيبان لحد ما تختار حساب واحد بس.';
+  } else {
+    note.style.display = 'none';
+  }
+
+  // مجموع تراكمي لكل مهارة عشان لو نفس المهارة اتكررت في أكتر من خطوة
+  const running = {};
+
+  $('plan-steps').innerHTML = list.map((s, i) => {
+    let preview = '';
+    if (singleAccount) {
+      const base = currentSkillLevel(singleAccount, s.perk);
+      if (base !== null) {
+        const before = base + (running[s.perk] || 0);
+        running[s.perk] = (running[s.perk] || 0) + s.count;
+        const after = base + running[s.perk];
+        preview = `<span style="font-family:var(--font-mono);font-size:11px;color:var(--sand);white-space:nowrap">${before} ← ${after}</span>`;
+      }
+    }
+    return `
     <div class="province" style="display:flex;align-items:center;gap:8px">
       <span style="color:var(--sand);font-family:var(--font-mono);font-size:12px;flex-shrink:0">${i + 1}</span>
-      <span style="flex:1">${s.count} × ${esc(s.label)}</span>
+      <span style="flex:1">${s.count} × ${esc(s.label)} <span style="color:var(--muted);font-size:11px">(${esc(s.currencyLabel)})</span></span>
+      ${preview}
       <button class="btn btn-sm btn-ghost" onclick="movePlanStep(${i}, -1)" ${i === 0 ? 'disabled' : ''}>↑</button>
       <button class="btn btn-sm btn-ghost" onclick="movePlanStep(${i}, 1)" ${i === list.length - 1 ? 'disabled' : ''}>↓</button>
       <button class="btn btn-sm btn-danger" onclick="removePlanStep(${i})">حذف</button>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 async function startPlan() {
@@ -1902,8 +1842,7 @@ async function startPlan() {
       body: JSON.stringify({
         kind: 'upgrade_plan', account_ids: ids,
         payload: {
-          steps: state.planSteps.map((s) => ({ perk: s.perk, count: s.count })),
-          currency: $('plan-currency').value,
+          steps: state.planSteps.map((s) => ({ perk: s.perk, count: s.count, currency: s.currency })),
           spread: $('plan-spread').checked,
         },
       }),
@@ -2038,7 +1977,6 @@ function bind() {
   $('tr-search').oninput = renderCountries;
 
   $('btn-travel').onclick = openTravelModal;
-  $('btn-upgrade').onclick = () => runGroup('upgrade');
   $('btn-plan').onclick = openPlanModal;
   $('btn-autoupgrade').onclick = () => runGroup('auto_upgrade');
   $('btn-refresh').onclick = () => runGroup('refresh', {}, false);
@@ -2153,7 +2091,6 @@ INDEX_HTML = """<!DOCTYPE html>
       <span class="command-count" id="pick-count">مفيش اختيار</span>
       <div class="topbar-spacer"></div>
       <button class="btn btn-go btn-sm" id="btn-travel" disabled>الدول والسفر</button>
-      <button class="btn btn-sm" id="btn-upgrade" disabled>ترقية</button>
       <button class="btn btn-sm" id="btn-plan" disabled>خطة تطوير</button>
       <button class="btn btn-sm" id="btn-autoupgrade" disabled>تطوير تلقائي</button>
       <button class="btn btn-sm" id="btn-refresh" disabled>تحديث البيانات</button>
@@ -2241,54 +2178,30 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<div class="overlay" id="modal-queue">
-  <div class="modal">
-    <div class="modal-head">
-      <h3>الطابور</h3>
-      <span id="queue-count" style="font-size:12px;color:var(--muted)"></span>
-    </div>
-    <div class="modal-body">
-      <div class="command-row" style="margin-bottom:10px">
-        <button class="btn btn-sm" onclick="selectAllQueue()">اختيار الكل</button>
-        <button class="btn btn-sm" onclick="selectNoneQueue()">إلغاء الاختيار</button>
-        <div class="topbar-spacer"></div>
-        <button class="btn btn-sm btn-danger" onclick="cancelSelectedQueue()">إلغاء المحدد</button>
-      </div>
-      <div class="province-list" id="queue-list" style="max-height:360px"></div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn btn-danger" onclick="cancelAllQueue()">إلغاء الطابور كله</button>
-      <button class="btn btn-ghost" data-close>إغلاق</button>
-    </div>
-  </div>
-</div>
-
 <div class="overlay" id="modal-plan">
   <div class="modal">
     <div class="modal-head"><h3>خطة تطوير بالتتابع</h3></div>
     <div class="modal-body">
       <div class="form-row">
-        <label for="plan-currency">العملة</label>
-        <select class="field" id="plan-currency" style="width:100%"></select>
-      </div>
-
-      <div class="form-row">
-        <label>أضف خطوة (مهارة + عدد مرات)</label>
-        <div style="display:flex;gap:6px">
-          <select class="field" id="plan-perk" style="flex:1"></select>
+        <label>أضف خطوة (مهارة + عملتها + عدد مرات)</label>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <select class="field" id="plan-perk" style="flex:2;min-width:110px"></select>
+          <select class="field" id="plan-step-currency" style="flex:1;min-width:80px"></select>
           <input class="field" id="plan-count" type="number" min="1" max="300"
-                 placeholder="العدد" style="width:88px">
+                 placeholder="العدد" style="width:76px">
           <button class="btn btn-sm btn-primary" onclick="addPlanStep()">إضافة</button>
         </div>
         <div class="hint">
-          مثال: أضف "٥٠ × العالِم" ثم أضف "٥٠ × الثكنات" — هينفّذوا بالترتيب ده بالظبط.<br>
+          كل خطوة ليها عملتها الخاصة — تقدر تطوّر "تقنيات الحرب" بالماس، وبعدين
+          "الإمداد والتدريب" بالفلوس، في نفس الخطة.<br>
           ملحوظة: اللعبة بتسمح بترقية واحدة بس في نفس الوقت، فكل ترقية بتستنى
           الوقت الحقيقي اللي اللعبة بتحدده (مش وقت ثابت) — ممكن ٥٠ ترقية تاخد
           أيام حسب مستوى الحساب، ودي حاجة من اللعبة نفسها مش من البوت.
         </div>
       </div>
 
-      <div class="province-list" id="plan-steps" style="max-height:200px;margin-top:8px"></div>
+      <div id="plan-preview-note" class="hint" style="display:none;margin-bottom:6px"></div>
+      <div class="province-list" id="plan-steps" style="max-height:220px;margin-top:8px"></div>
 
       <div class="form-row" style="margin-top:14px">
         <label class="toggle" style="width:100%">
@@ -2448,6 +2361,7 @@ def _plan_summary(plan):
     return {
         "current_perk": step["perk"],
         "current_label": PERKS.get(step["perk"], {}).get("label", step["perk"]),
+        "current_currency": CURRENCIES.get(step.get("currency", "money"), ""),
         "done_in_step": plan.get("done_in_step", 0),
         "step_count": step["count"],
         "step_index": idx + 1,
@@ -2729,19 +2643,17 @@ _countries_cache = {"data": None, "at": 0}
 
 def _handle_upgrade_plan(data):
     """
-    خطة تطوير بالتتابع: كذا خطوة، كل خطوة (مهارة + عدد مرات)، بتتنفذ بالكامل
-    قبل ما اللي بعدها تبدأ. مثال: [{"perk":"scientist","count":50},
-    {"perk":"barracks","count":50}] = ٥٠ ترقية علم، وبعدين ٥٠ ترقية ثكنات.
+    خطة تطوير بالتتابع: كذا خطوة، كل خطوة (مهارة + عدد مرات + عملتها الخاصة)،
+    بتتنفذ بالكامل قبل ما اللي بعدها تبدأ. مثال:
+    [{"perk":"war_techniques","count":50,"currency":"diamond"},
+     {"perk":"supply_drill","count":50,"currency":"money"}]
+    = ٥٠ ترقية تقنيات حرب بالماس، وبعدين ٥٠ ترقية إمداد وتدريب بالفلوس.
     """
     targets = _resolve_targets(data)
     if not targets:
         return jsonify({"ok": False, "error": "مفيش حسابات مختارة (أو مفيش توكن ليها)"}), 400
 
     payload = data.get("payload") or {}
-    currency = (payload.get("currency") or "money").strip()
-    if currency not in CURRENCIES:
-        return jsonify({"ok": False, "error": "عملة غير معروفة"}), 400
-
     raw_steps = payload.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         return jsonify({"ok": False, "error": "لازم تضيف خطوة واحدة على الأقل"}), 400
@@ -2753,6 +2665,9 @@ def _handle_upgrade_plan(data):
         perk = (item.get("perk") or "").strip()
         if perk not in PERKS:
             return jsonify({"ok": False, "error": f"مهارة غير معروفة: {perk}"}), 400
+        currency = (item.get("currency") or "").strip()
+        if currency not in CURRENCIES:
+            return jsonify({"ok": False, "error": f"عملة غير معروفة في خطوة {PERKS[perk]['label']}"}), 400
         try:
             count = int(item.get("count"))
         except (TypeError, ValueError):
@@ -2762,7 +2677,7 @@ def _handle_upgrade_plan(data):
                 "ok": False,
                 "error": f"العدد في كل خطوة لازم يكون بين ١ و {MAX_PLAN_STEP_COUNT}",
             }), 400
-        steps.append({"perk": perk, "count": count})
+        steps.append({"perk": perk, "count": count, "currency": currency})
 
     total_per_account = sum(s["count"] for s in steps)
     if total_per_account > MAX_PLAN_TOTAL_COUNT:
@@ -2774,14 +2689,15 @@ def _handle_upgrade_plan(data):
     spread = bool(payload.get("spread", True)) and len(targets) > 1
     delay = 0
     for account_id in targets:
-        plan = {"steps": steps, "currency": currency, "step_index": 0, "done_in_step": 0}
+        plan = {"steps": steps, "step_index": 0, "done_in_step": 0}
         db_execute("UPDATE accounts SET upgrade_plan=%s::jsonb WHERE id=%s",
                   (json.dumps(plan), account_id))
         queue_task(account_id, "plan_step", delay_seconds=delay)
         if spread:
             delay += random.randint(GROUP_SPREAD_MIN, GROUP_SPREAD_MAX)
 
-    steps_desc = " ← ".join(f"{s['count']}×{PERKS[s['perk']]['label']}" for s in steps)
+    steps_desc = " ← ".join(
+        f"{s['count']}×{PERKS[s['perk']]['label']}({CURRENCIES[s['currency']]})" for s in steps)
     note = (f"خطة تطوير بدأت على {len(targets)} حساب: {steps_desc}. "
            f"هتمشي في الخلفية حسب وقت الترقية الحقيقي في اللعبة — مش وقت ثابت.")
     add_log(note, "info")
@@ -2865,61 +2781,6 @@ def api_countries():
         c["provinces"].sort(key=lambda p: (not p["is_capital"], p["name"]))
 
     return jsonify({"ok": True, "countries": countries, "cached": cached})
-
-
-@app.route("/api/tasks")
-@login_required
-def api_list_tasks():
-    """قايمة المهام المنتظرة (pending) — بنجيبها مع اسم الحساب عشان تبان في القايمة."""
-    rows = db_all(
-        """SELECT t.id, t.account_id, t.kind, t.payload, t.run_at,
-                  a.label AS account_label, a.game_name AS account_game_name
-           FROM tasks t
-           JOIN accounts a ON a.id = t.account_id
-           WHERE t.status='pending'
-           ORDER BY t.run_at""")
-    return jsonify({"ok": True, "tasks": [
-        {
-            "id": r["id"],
-            "account_id": r["account_id"],
-            "account_label": r["account_label"] or r["account_game_name"] or f"حساب #{r['account_id']}",
-            "kind": r["kind"],
-            "kind_label": KIND_LABELS.get(r["kind"], r["kind"]),
-            "payload": r["payload"],
-            "run_at": r["run_at"].isoformat(),
-        }
-        for r in rows
-    ]})
-
-
-@app.route("/api/tasks/<int:task_id>", methods=["DELETE"])
-@login_required
-def api_cancel_task(task_id):
-    n = db_execute(
-        "DELETE FROM tasks WHERE id=%s AND status='pending'", (task_id,))
-    if not n:
-        return jsonify({"ok": False, "error": "المهمة مش موجودة أو خلصت خلاص"}), 404
-    return jsonify({"ok": True})
-
-
-@app.route("/api/tasks/cancel", methods=["POST"])
-@login_required
-def api_cancel_tasks_bulk():
-    """إلغاء مجموعة مهام بمعرّفاتها، أو كل المهام المنتظرة لو all=true."""
-    data = request.get_json(silent=True) or {}
-    if data.get("all"):
-        n = db_execute("DELETE FROM tasks WHERE status='pending'")
-        add_log(f"اتلغى {n} مهمة من الطابور بالكامل", "warn")
-        return jsonify({"ok": True, "cancelled": n})
-
-    ids = data.get("ids")
-    if not isinstance(ids, list) or not ids:
-        return jsonify({"ok": False, "error": "مفيش مهام مختارة"}), 400
-    n = db_execute(
-        "DELETE FROM tasks WHERE status='pending' AND id = ANY(%s)",
-        ([int(i) for i in ids],))
-    add_log(f"اتلغى {n} مهمة من الطابور", "warn")
-    return jsonify({"ok": True, "cancelled": n})
 
 
 @app.route("/api/tick", methods=["POST"])
