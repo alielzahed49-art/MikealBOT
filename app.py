@@ -200,6 +200,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     auto_quests   BOOLEAN NOT NULL DEFAULT FALSE,
     auto_wheel    BOOLEAN NOT NULL DEFAULT FALSE,
     auto_work     BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_pills    BOOLEAN NOT NULL DEFAULT FALSE,
+    pills_limit   BIGINT NOT NULL DEFAULT 2500,
+    auto_military BOOLEAN NOT NULL DEFAULT FALSE,
+    military_joined_until TIMESTAMPTZ,
 
     proxy_type    TEXT NOT NULL DEFAULT 'http',
     proxy_host    TEXT NOT NULL DEFAULT '',
@@ -209,6 +213,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     proxy_note    TEXT NOT NULL DEFAULT '',
 
     game_name     TEXT NOT NULL DEFAULT '',
+    avatar_url    TEXT NOT NULL DEFAULT '',
     level_num     TEXT NOT NULL DEFAULT '—',
     xp_pct        INTEGER NOT NULL DEFAULT 0,
     balance       TEXT NOT NULL DEFAULT '—',
@@ -257,6 +262,11 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);
 MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS travel_destination TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS travel_sent_at TIMESTAMPTZ",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_pills BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS pills_limit BIGINT NOT NULL DEFAULT 2500",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS avatar_url TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_military BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS military_joined_until TIMESTAMPTZ",
 ]
 
 
@@ -373,7 +383,7 @@ class GameClient:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "ar,ar-SA;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
             "User-Agent": self.user_agent,
             "Origin": GAME_ORIGIN,
             "Referer": f"{GAME_ORIGIN}/",
@@ -445,6 +455,27 @@ class GameClient:
                 "لازم تتأكد منه من الشبكة (Network) وتبعتهولي أظبطه"
             )
         raise GameError(_message_of(body) or f"طلب الإقامة اترفض ({status})")
+
+    def craft_pills(self, diamonds):
+        """POST /auto/craft-pills {diamonds} — بيحوّل ماس لحبوب صحة (١ ماسة = ٥ حبات)."""
+        status, body = self.post("/auto/craft-pills", {"diamonds": int(diamonds)})
+        if status in (200, 201) and body.get("success", True):
+            return body
+        raise GameError(_message_of(body) or f"تحويل الحبوب اترفض ({status})")
+
+    def my_military_op(self):
+        """GET /military-ops/my — العملية العسكرية النشطة دلوقتي وهل الحساب منضم ولا لأ."""
+        data = self.get("/military-ops/my")
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    def join_military_op(self, op_id):
+        """POST /military-ops/{op_id}/join — انضمام للعملية."""
+        status, body = self.post(f"/military-ops/{op_id}/join", {})
+        if status in (200, 201):
+            return body
+        raise GameError(_message_of(body) or f"الانضمام للعملية اترفض ({status})")
 
     def travel(self, destination):
         status, body = self.post("/provinces/travel/start", {"destination": destination})
@@ -543,6 +574,7 @@ def parse_profile(profile):
 
     return {
         "game_name": profile.get("username", "") or "",
+        "avatar_url": profile.get("avatar_url", "") or "",
         "level_num": str(profile.get("level", "—")),
         "xp_pct": max(0, min(100, pct)),
         "balance": balance_txt,
@@ -643,14 +675,15 @@ def task_refresh(account, payload):
 
     db_execute(
         f"""UPDATE accounts SET
-             game_name=%s, level_num=%s, xp_pct=%s, balance=%s, diamonds=%s,
+             game_name=%s, avatar_url=%s, level_num=%s, xp_pct=%s, balance=%s, diamonds=%s,
              location=%s, nation=%s, lv_barracks=%s, lv_war=%s,
              lv_scientist=%s, lv_supply=%s,
              status='ok', last_error='', last_seen=NOW(){extra_sets}
            WHERE id=%s""",
-        (data["game_name"], data["level_num"], data["xp_pct"], data["balance"],
-         data["diamonds"], data["location"], data["nation"], data["lv_barracks"],
-         data["lv_war"], data["lv_scientist"], data["lv_supply"], account["id"]))
+        (data["game_name"], data["avatar_url"], data["level_num"], data["xp_pct"],
+         data["balance"], data["diamonds"], data["location"], data["nation"],
+         data["lv_barracks"], data["lv_war"], data["lv_scientist"], data["lv_supply"],
+         account["id"]))
     return f"البيانات اتحدّثت — المستوى {data['level_num']}"
 
 
@@ -747,6 +780,67 @@ def task_work(account, payload):
     return "بدأ الشغل في المصنع"
 
 
+def _current_diamonds(account):
+    try:
+        return int(str(account.get("diamonds", "0")).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def task_pills_auto(account, payload):
+    """
+    تحويل تلقائي — بيحوّل بس الماس الزايد عن الحد اللي محطوطه، وبشرط الزيادة
+    تكون ١٠٠ ماسة على الأقل (عشان منزعجش اللعبة بطلبات تافهة).
+    """
+    limit = int(account.get("pills_limit") or 2500)
+    current = _current_diamonds(account)
+    excess = current - limit
+    if excess < 100:
+        return None  # لسه ملحقش الحد — من غير رسالة عشان منزحمش اللوج
+
+    res = client_for(account).craft_pills(excess)
+    pills = res.get("pills_crafted", excess * 5)
+    remaining = res.get("diamonds_remaining", max(0, current - excess))
+    db_execute("UPDATE accounts SET diamonds=%s WHERE id=%s", (str(remaining), account["id"]))
+    return f"تحويل تلقائي: {excess:,} ماسة → {pills:,} حبة (باقي {remaining:,})"
+
+
+def task_military_auto(account, payload):
+    """
+    لو فيه عملية عسكرية نشطة والحساب مش منضم (أو انضمامه هيخلص قريب)، بينضم تاني.
+    اللعبة نفسها بتحدّد مدة الانضمام؛ منجدّدش قبل آخر ١٠ دقايق منها.
+    """
+    client = client_for(account)
+    data = client.my_military_op()
+    if not data:
+        return None  # مفيش عملية نشطة دلوقتي
+
+    op = data.get("operation") or {}
+    op_id = op.get("id")
+    if not op_id:
+        return None
+
+    joined_until = _parse_time(data.get("joined_until"))
+    is_joined = bool(data.get("is_joined"))
+
+    needs_join = True
+    if joined_until:
+        needs_join = now() >= (joined_until - timedelta(minutes=10))
+    elif is_joined:
+        needs_join = False
+
+    if not needs_join:
+        return None
+
+    res = client.join_military_op(op_id)
+    until = _parse_time(res.get("joined_until"))
+    if until:
+        db_execute("UPDATE accounts SET military_joined_until=%s WHERE id=%s",
+                   (until, account["id"]))
+        return f"انضم للعملية العسكرية — لحد {until.strftime('%H:%M')}"
+    return "انضم للعملية العسكرية"
+
+
 HANDLERS = {
     "refresh": task_refresh,
     "travel": task_travel,
@@ -757,12 +851,15 @@ HANDLERS = {
     "quests": task_quests,
     "wheel": task_wheel,
     "work": task_work,
+    "pills_auto": task_pills_auto,
+    "military_auto": task_military_auto,
 }
 
 KIND_LABELS = {
     "refresh": "تحديث", "travel": "سفر", "visa": "طلب فيزا", "residence": "طلب إقامة",
     "upgrade": "ترقية", "auto_upgrade": "تطوير تلقائي", "quests": "مهام يومية",
-    "wheel": "عجلة", "work": "شغل",
+    "wheel": "عجلة", "work": "شغل", "pills_auto": "تحويل حبوب تلقائي",
+    "military_auto": "انضمام عسكري",
 }
 
 
@@ -863,6 +960,12 @@ def schedule_periodic():
             work_until = account.get("work_until")
             if (work_until is None or work_until <= now()) and _queue_if_free(aid, "work"):
                 added += 1
+
+        if account.get("auto_pills") and _queue_if_free(aid, "pills_auto", min_gap_minutes=5):
+            added += 1
+
+        if account.get("auto_military") and _queue_if_free(aid, "military_auto", min_gap_minutes=120):
+            added += 1
 
     # لو عدّت ساعة من غير ما نتأكد إن الحساب وصل، بنشيل شارة "بيسافر" —
     # يمكن اللعبة رفضت السفر أو الرحلة خلصت وإحنا فاتنا التحديث اللي أكّد كده
@@ -999,8 +1102,14 @@ select.field{cursor:pointer}
 .card.selected{border-color:var(--red);box-shadow:0 0 0 1px var(--red-dim)}
 .card.is-error{border-color:rgba(229,72,77,.4)}
 .card-head{display:flex;align-items:flex-start;gap:10px}
-.status-star{width:26px;height:26px;flex-shrink:0;margin-top:2px}
-.status-star polygon{fill:none;stroke:var(--muted);stroke-width:7;stroke-linejoin:round;
+.avatar-wrap{position:relative;width:38px;height:38px;flex-shrink:0}
+.avatar-img{width:100%;height:100%;object-fit:cover;border-radius:50%;
+  border:1px solid var(--line-soft);display:block;background:var(--bg-raise)}
+.avatar-fallback{width:100%;height:100%;border-radius:50%;background:var(--bg-raise);
+  border:1px solid var(--line-soft);display:flex;align-items:center;justify-content:center;font-size:17px}
+.status-star{position:absolute;bottom:-4px;left:-4px;width:16px;height:16px;
+  background:var(--panel);border-radius:50%}
+.status-star polygon{fill:none;stroke:var(--muted);stroke-width:9;stroke-linejoin:round;
   transition:stroke .25s}
 .card.is-running .status-star polygon{stroke:var(--green-bright);
   filter:drop-shadow(0 0 5px rgba(37,163,95,.5))}
@@ -1242,7 +1351,13 @@ function cardHtml(a) {
     <div class="card-head">
       <input class="pick" type="checkbox" ${state.selected.has(a.id) ? 'checked' : ''}
              onchange="togglePick(${a.id}, this.checked)" aria-label="اختيار ${esc(a.label)}">
-      <svg class="status-star" viewBox="0 0 100 100" aria-hidden="true">${STAR}</svg>
+      <div class="avatar-wrap">
+        ${a.avatar_url
+          ? `<img class="avatar-img" src="${esc(a.avatar_url)}" alt=""
+                 onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'avatar-fallback',textContent:'🎮'}))">`
+          : `<div class="avatar-fallback">🎮</div>`}
+        <svg class="status-star" viewBox="0 0 100 100" aria-hidden="true">${STAR}</svg>
+      </div>
       <div class="card-title">
         <h3>${esc(a.label || 'بدون اسم')}</h3>
         <div class="sub">
@@ -1296,6 +1411,20 @@ function cardHtml(a) {
       ${toggle('auto_quests', 'مهام يومية')}
       ${toggle('auto_wheel', 'العجلة')}
       ${toggle('auto_work', 'الشغل')}
+      ${toggle('auto_military', 'عملية عسكرية')}
+    </div>
+
+    <div class="proxy-line ${a.auto_pills ? 'set' : ''}" style="gap:6px">
+      <span class="dot"></span>
+      <label class="toggle ${a.auto_pills ? 'on' : ''}" style="padding:0;border:none;background:none;flex-shrink:0">
+        <input type="checkbox" ${a.auto_pills ? 'checked' : ''}
+               onchange="patchAccount(${a.id}, {auto_pills: this.checked})">
+        <span>حبوب تلقائي</span>
+      </label>
+      <span style="font-size:11px;color:var(--muted)">فوق</span>
+      <input class="field" type="number" min="0" value="${a.pills_limit}" style="width:80px;padding:5px 7px;font-size:11.5px"
+             onchange="patchAccount(${a.id}, {pills_limit: parseInt(this.value)||0})">
+      <span style="font-size:11px;color:var(--muted)">ماسة</span>
     </div>
 
     <div class="proxy-line ${a.proxy.configured ? 'set' : ''}">
@@ -1921,6 +2050,10 @@ def _public_account(row):
         "perk": row["perk"], "currency": row["currency"],
         "auto_upgrade": row["auto_upgrade"], "auto_quests": row["auto_quests"],
         "auto_wheel": row["auto_wheel"], "auto_work": row["auto_work"],
+        "auto_pills": row["auto_pills"], "pills_limit": row["pills_limit"],
+        "auto_military": row["auto_military"],
+        "military_joined_until": row["military_joined_until"].isoformat()
+                                  if row["military_joined_until"] else None,
         "proxy": {
             "type": row["proxy_type"], "note": row["proxy_note"],
             "line_masked": (f"{row['proxy_host']}:{row['proxy_port']}"
@@ -1928,7 +2061,8 @@ def _public_account(row):
                            if row["proxy_host"] else "",
             "configured": bool(row["proxy_host"] and row["proxy_port"]),
         },
-        "game_name": row["game_name"], "level_num": row["level_num"],
+        "game_name": row["game_name"], "avatar_url": row["avatar_url"],
+        "level_num": row["level_num"],
         "xp_pct": row["xp_pct"], "balance": row["balance"],
         "diamonds": row["diamonds"], "location": row["location"],
         "nation": row["nation"],
@@ -1970,7 +2104,8 @@ def api_state():
 
 # ── إدارة الحسابات ───────────────────────────────────────
 _EDITABLE_TEXT = {"label", "token", "squad", "perk", "currency", "proxy_type", "proxy_note"}
-_EDITABLE_BOOL = {"enabled", "auto_upgrade", "auto_quests", "auto_wheel", "auto_work"}
+_EDITABLE_BOOL = {"enabled", "auto_upgrade", "auto_quests", "auto_wheel", "auto_work",
+                  "auto_pills", "auto_military"}
 
 
 @app.route("/api/accounts", methods=["POST"])
@@ -2031,6 +2166,16 @@ def api_update_account(account_id):
             sets += ["proxy_host=%s", "proxy_port=%s", "proxy_user=%s", "proxy_pass=%s"]
             params += [parsed["proxy_host"], parsed["proxy_port"],
                       parsed["proxy_user"], parsed["proxy_pass"]]
+
+    if "pills_limit" in data:
+        try:
+            limit = int(data.get("pills_limit"))
+            if limit < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "حد الماس لازم يكون رقم صحيح موجب"}), 400
+        sets.append("pills_limit=%s")
+        params.append(limit)
 
     if not sets:
         return jsonify({"ok": False, "error": "مفيش حاجة تتغيّر"}), 400
