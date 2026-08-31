@@ -1385,6 +1385,7 @@ const state = {
   selected: new Set(), squadFilter: '',
   countries: [], expandedCountry: null,
   planSteps: [],
+  queueTasks: [], queueSelected: new Set(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1436,7 +1437,7 @@ function renderChips(s) {
     <span class="chip">الحسابات <b>${s.total}</b></span>
     <span class="chip on">شغّال <b>${s.running}</b></span>
     ${s.errors ? `<span class="chip bad">أخطاء <b>${s.errors}</b></span>` : ''}
-    ${s.pending_tasks ? `<span class="chip wait">في الطابور <b>${s.pending_tasks}</b></span>` : ''}
+    ${s.pending_tasks ? `<span class="chip wait" style="cursor:pointer" onclick="openQueueModal()">في الطابور <b>${s.pending_tasks}</b></span>` : ''}
   `;
 }
 
@@ -1747,6 +1748,98 @@ async function testProxy() {
     btn.textContent = 'اختبار الاتصال';
     loadState();
   }
+}
+
+async function openQueueModal() {
+  state.queueSelected = new Set();
+  openModal('modal-queue');
+  $('queue-list').innerHTML = '<div class="province" style="color:var(--muted)">بنجيب الطابور…</div>';
+  await loadQueue();
+}
+
+async function loadQueue() {
+  try {
+    const r = await api('/api/tasks');
+    state.queueTasks = r.tasks;
+    renderQueue();
+  } catch (e) {
+    $('queue-list').innerHTML = `<div class="province" style="color:var(--red-bright)">${esc(e.message)}</div>`;
+  }
+}
+
+function queueRelative(iso) {
+  const diffMs = new Date(iso).getTime() - Date.now();
+  const mins = Math.round(diffMs / 60000);
+  if (mins <= 0) return 'دلوقتي تقريباً';
+  if (mins < 60) return `بعد ${mins} دقيقة`;
+  return `بعد ${Math.round(mins / 60)} ساعة`;
+}
+
+function renderQueue() {
+  const list = state.queueTasks || [];
+  $('queue-count').textContent = `${list.length} مهمة`;
+
+  if (!list.length) {
+    $('queue-list').innerHTML = '<div class="province" style="color:var(--muted)">الطابور فاضي</div>';
+    return;
+  }
+
+  $('queue-list').innerHTML = list.map((t) => `
+    <div class="province" style="display:flex;align-items:center;gap:8px">
+      <input type="checkbox" class="pick" style="margin:0" ${state.queueSelected.has(t.id) ? 'checked' : ''}
+             onchange="toggleQueuePick(${t.id}, this.checked)">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px">${esc(t.kind_label)}</div>
+        <div style="font-size:11px;color:var(--muted)">${esc(t.account_label)} · ${queueRelative(t.run_at)}</div>
+      </div>
+      <button class="btn btn-sm btn-danger" onclick="cancelOneQueue(${t.id})">إلغاء</button>
+    </div>`).join('');
+}
+
+function toggleQueuePick(id, on) {
+  if (on) state.queueSelected.add(id); else state.queueSelected.delete(id);
+}
+
+function selectAllQueue() {
+  state.queueSelected = new Set((state.queueTasks || []).map((t) => t.id));
+  renderQueue();
+}
+
+function selectNoneQueue() {
+  state.queueSelected = new Set();
+  renderQueue();
+}
+
+async function cancelOneQueue(id) {
+  try {
+    await api(`/api/tasks/${id}`, { method: 'DELETE' });
+    state.queueSelected.delete(id);
+    await loadQueue();
+    await loadState();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function cancelSelectedQueue() {
+  const ids = [...state.queueSelected];
+  if (!ids.length) return toast('اختار مهمة واحدة على الأقل', true);
+  try {
+    const r = await api('/api/tasks/cancel', { method: 'POST', body: JSON.stringify({ ids }) });
+    toast(`اتلغى ${r.cancelled} مهمة`);
+    state.queueSelected = new Set();
+    await loadQueue();
+    await loadState();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function cancelAllQueue() {
+  if (!confirm('تلغي الطابور كله؟')) return;
+  try {
+    const r = await api('/api/tasks/cancel', { method: 'POST', body: JSON.stringify({ all: true }) });
+    toast(`اتلغى ${r.cancelled} مهمة`);
+    state.queueSelected = new Set();
+    await loadQueue();
+    await loadState();
+  } catch (e) { toast(e.message, true); }
 }
 
 function openPlanModal() {
@@ -2143,6 +2236,28 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="modal-foot">
       <button class="btn btn-primary" id="px-save">حفظ</button>
       <button class="btn btn-go" id="px-test">اختبار الاتصال</button>
+      <button class="btn btn-ghost" data-close>إغلاق</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-queue">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>الطابور</h3>
+      <span id="queue-count" style="font-size:12px;color:var(--muted)"></span>
+    </div>
+    <div class="modal-body">
+      <div class="command-row" style="margin-bottom:10px">
+        <button class="btn btn-sm" onclick="selectAllQueue()">اختيار الكل</button>
+        <button class="btn btn-sm" onclick="selectNoneQueue()">إلغاء الاختيار</button>
+        <div class="topbar-spacer"></div>
+        <button class="btn btn-sm btn-danger" onclick="cancelSelectedQueue()">إلغاء المحدد</button>
+      </div>
+      <div class="province-list" id="queue-list" style="max-height:360px"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-danger" onclick="cancelAllQueue()">إلغاء الطابور كله</button>
       <button class="btn btn-ghost" data-close>إغلاق</button>
     </div>
   </div>
@@ -2750,6 +2865,61 @@ def api_countries():
         c["provinces"].sort(key=lambda p: (not p["is_capital"], p["name"]))
 
     return jsonify({"ok": True, "countries": countries, "cached": cached})
+
+
+@app.route("/api/tasks")
+@login_required
+def api_list_tasks():
+    """قايمة المهام المنتظرة (pending) — بنجيبها مع اسم الحساب عشان تبان في القايمة."""
+    rows = db_all(
+        """SELECT t.id, t.account_id, t.kind, t.payload, t.run_at,
+                  a.label AS account_label, a.game_name AS account_game_name
+           FROM tasks t
+           JOIN accounts a ON a.id = t.account_id
+           WHERE t.status='pending'
+           ORDER BY t.run_at""")
+    return jsonify({"ok": True, "tasks": [
+        {
+            "id": r["id"],
+            "account_id": r["account_id"],
+            "account_label": r["account_label"] or r["account_game_name"] or f"حساب #{r['account_id']}",
+            "kind": r["kind"],
+            "kind_label": KIND_LABELS.get(r["kind"], r["kind"]),
+            "payload": r["payload"],
+            "run_at": r["run_at"].isoformat(),
+        }
+        for r in rows
+    ]})
+
+
+@app.route("/api/tasks/<int:task_id>", methods=["DELETE"])
+@login_required
+def api_cancel_task(task_id):
+    n = db_execute(
+        "DELETE FROM tasks WHERE id=%s AND status='pending'", (task_id,))
+    if not n:
+        return jsonify({"ok": False, "error": "المهمة مش موجودة أو خلصت خلاص"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tasks/cancel", methods=["POST"])
+@login_required
+def api_cancel_tasks_bulk():
+    """إلغاء مجموعة مهام بمعرّفاتها، أو كل المهام المنتظرة لو all=true."""
+    data = request.get_json(silent=True) or {}
+    if data.get("all"):
+        n = db_execute("DELETE FROM tasks WHERE status='pending'")
+        add_log(f"اتلغى {n} مهمة من الطابور بالكامل", "warn")
+        return jsonify({"ok": True, "cancelled": n})
+
+    ids = data.get("ids")
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"ok": False, "error": "مفيش مهام مختارة"}), 400
+    n = db_execute(
+        "DELETE FROM tasks WHERE status='pending' AND id = ANY(%s)",
+        ([int(i) for i in ids],))
+    add_log(f"اتلغى {n} مهمة من الطابور", "warn")
+    return jsonify({"ok": True, "cancelled": n})
 
 
 @app.route("/api/tick", methods=["POST"])
