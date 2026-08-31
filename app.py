@@ -73,6 +73,14 @@ LOG_KEEP = _int("LOG_KEEP", 400)
 GROUP_SPREAD_MIN = _int("GROUP_SPREAD_MIN", 15)
 GROUP_SPREAD_MAX = _int("GROUP_SPREAD_MAX", 90)
 
+# خطة التطوير بالتتابع: مسافة بين كل ترقية والتانية جوه نفس الحساب،
+# وأقصى عدد ترقيات مسموح بيه في الخطوة الواحدة وفي الخطة كلها (حماية من الأغلاط)
+# خطة التطوير بالتتابع: أقصى عدد ترقيات مسموح بيه في الخطوة الواحدة وفي الخطة
+# كلها (حماية من الأغلاط). مفيش "مدة ثابتة بين الخطوات" — الوقت الحقيقي بييجي
+# من اللعبة نفسها بعد كل محاولة (شوف skill_cooldown_seconds).
+MAX_PLAN_STEP_COUNT = _int("MAX_PLAN_STEP_COUNT", 300)
+MAX_PLAN_TOTAL_COUNT = _int("MAX_PLAN_TOTAL_COUNT", 1000)
+
 # أقصى وقت نسيب فيه شارة "بيسافر" ظاهرة من غير تأكيد وصول
 TRAVEL_TIMEOUT_MINUTES = _int("TRAVEL_TIMEOUT_MINUTES", 60)
 
@@ -204,6 +212,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     pills_limit   BIGINT NOT NULL DEFAULT 2500,
     auto_military BOOLEAN NOT NULL DEFAULT FALSE,
     military_joined_until TIMESTAMPTZ,
+    upgrade_plan  JSONB,
 
     proxy_type    TEXT NOT NULL DEFAULT 'http',
     proxy_host    TEXT NOT NULL DEFAULT '',
@@ -267,6 +276,7 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS avatar_url TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_military BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS military_joined_until TIMESTAMPTZ",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS upgrade_plan JSONB",
 ]
 
 
@@ -328,6 +338,24 @@ class TokenInvalid(GameError):
     """التوكن مرفوض (401/403)."""
 
 
+class AlreadyUpgrading(GameError):
+    """
+    فيه ترقية شغّالة بالفعل — اللعبة بتسمح بترقية واحدة بس في نفس الوقت
+    للحساب كله (مش لكل مهارة لوحدها). remaining_seconds من رد اللعبة نفسها،
+    مش رقم مخترع.
+    """
+    def __init__(self, message, remaining_seconds):
+        super().__init__(message)
+        self.remaining_seconds = remaining_seconds
+
+
+class RateLimited(GameError):
+    """اللعبة قالت "بطّئ" — نستنى المدة اللي هي حددتها بالظبط."""
+    def __init__(self, message, retry_after):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 def build_proxies(account):
     """بيحوّل بيانات البروكسي لصيغة requests. بيرجع None لو مفيش بروكسي."""
     host = (account.get("proxy_host") or "").strip()
@@ -369,6 +397,36 @@ def _message_of(body):
         if isinstance(val, str) and val.strip():
             return val.strip()
     return ""
+
+
+# كلمات اللعبة بترجّعها في رسالة الخطأ (تركي/إنجليزي — بنفحص الاتنين احتياطاً)
+_ALREADY_UPGRADING_HINTS = [
+    "başka bir beceri", "already upgrading", "devam ediyor",
+    "upgrade in progress", "skill_upgrade_in_progress",
+]
+_RATE_LIMIT_HINTS = ["çok hızlı", "too many", "rate limit", "bekleyin", "wait", "dakika"]
+
+_ALL_SKILL_KEYS = ["kisla", "savas_teknikleri", "bilim_insani", "ikmal_talim"]
+
+
+def skill_cooldown_seconds(profile):
+    """
+    بيدوّر في بروفايل الحساب على أي مهارة (من الأربعة) عندها ترقية شغّالة دلوقتي،
+    ويرجع الثواني المتبقية ليها. بيرجع None لو مفيش ترقية شغّالة خالص.
+    اللعبة بتسمح بترقية واحدة بس في نفس الوقت للحساب كله، فمفيش فرق نتأكد من
+    أنهي مهارة بالظبط — المهم نعرف إمتى الحساب هيبقى حر تاني.
+    """
+    if not isinstance(profile, dict):
+        return None
+    skills = profile.get("skills", {}) or {}
+    for key in _ALL_SKILL_KEYS:
+        pending_at = skills.get(f"{key}_pending_at")
+        if pending_at:
+            parsed = _parse_time(pending_at)
+            if parsed:
+                remaining = (parsed - datetime.now(timezone.utc)).total_seconds()
+                return max(0, int(remaining))
+    return None
 
 
 class GameClient:
@@ -488,7 +546,20 @@ class GameClient:
                                  {"skill": skill_key, "type": currency})
         if status in (200, 201):
             return body
-        raise GameError(_message_of(body) or f"الترقية اترفضت ({status})")
+
+        message = _message_of(body)
+        haystack = f"{message} {body}".lower()
+
+        if any(h in haystack for h in _ALREADY_UPGRADING_HINTS):
+            remaining_ms = body.get("remaining_ms", 0) if isinstance(body, dict) else 0
+            remaining_s = max(60, int(remaining_ms / 1000)) if remaining_ms else 60
+            raise AlreadyUpgrading(message or "فيه ترقية شغّالة بالفعل", remaining_s)
+
+        if any(h in haystack for h in _RATE_LIMIT_HINTS):
+            retry_after = body.get("retryAfter", 65) if isinstance(body, dict) else 65
+            raise RateLimited(message or "طلبات كتير بسرعة", retry_after)
+
+        raise GameError(message or f"الترقية اترفضت ({status})")
 
     def toggle_auto_skill(self, skill_key, currency):
         status, body = self.post("/players/skills/auto/toggle",
@@ -841,6 +912,66 @@ def task_military_auto(account, payload):
     return "انضم للعملية العسكرية"
 
 
+def task_plan_step(account, payload):
+    """
+    بينفّذ خطوة واحدة بس من خطة التطوير، وبيجدول الخطوة الجاية لوحده لما يجيله
+    وقتها الحقيقي — اللعبة مسموح فيها ترقية واحدة بس شغّالة في نفس الوقت
+    للحساب كله، فمفيش معنى إننا نحاول قبل الأوان.
+    """
+    plan = account.get("upgrade_plan")
+    if not plan:
+        return None  # الخطة اتلغت أو خلصت قبل كده
+
+    steps = plan.get("steps") or []
+    idx = plan.get("step_index", 0)
+    if idx >= len(steps):
+        db_execute("UPDATE accounts SET upgrade_plan=NULL WHERE id=%s", (account["id"],))
+        return "خطة التطوير خلصت بالكامل"
+
+    step = steps[idx]
+    perk = step["perk"]
+    count = step["count"]
+    done_before = plan.get("done_in_step", 0)
+    currency = plan.get("currency", "money")
+    skill_key = PERK_KEYS.get(perk)
+    label = PERKS.get(perk, {}).get("label", perk)
+    client = client_for(account)
+
+    try:
+        client.upgrade_skill(skill_key, currency)
+    except AlreadyUpgrading as e:
+        # لسه فيه ترقية شغّالة (مش بالضرورة من الخطة — ممكن حد بدأ ترقية يدوي) —
+        # منعدّش الخطوة دي فاشلة، نستنى بس ونجرب تاني بعد الوقت اللي اللعبة قالته
+        queue_task(account["id"], "plan_step", delay_seconds=e.remaining_seconds)
+        return None
+    except RateLimited as e:
+        queue_task(account["id"], "plan_step", delay_seconds=e.retry_after)
+        return None
+
+    done_after = done_before + 1
+    if done_after >= count:
+        next_idx, next_done = idx + 1, 0
+    else:
+        next_idx, next_done = idx, done_after
+
+    if next_idx >= len(steps):
+        db_execute("UPDATE accounts SET upgrade_plan=NULL WHERE id=%s", (account["id"],))
+        return f"خطة التطوير خلصت بالكامل — آخر خطوة: {label} ({done_after}/{count})"
+
+    plan["step_index"], plan["done_in_step"] = next_idx, next_done
+    db_execute("UPDATE accounts SET upgrade_plan=%s::jsonb WHERE id=%s",
+              (json.dumps(plan), account["id"]))
+
+    # نجيب الوقت الحقيقي من بروفايل محدّث بدل ما نخمّن
+    try:
+        wait_s = skill_cooldown_seconds(client.profile()) or 65
+    except Exception:
+        wait_s = 65
+    queue_task(account["id"], "plan_step", delay_seconds=wait_s)
+
+    return f"ترقية {label} ({done_after}/{count})"
+
+
 HANDLERS = {
     "refresh": task_refresh,
     "travel": task_travel,
@@ -853,13 +984,14 @@ HANDLERS = {
     "work": task_work,
     "pills_auto": task_pills_auto,
     "military_auto": task_military_auto,
+    "plan_step": task_plan_step,
 }
 
 KIND_LABELS = {
     "refresh": "تحديث", "travel": "سفر", "visa": "طلب فيزا", "residence": "طلب إقامة",
     "upgrade": "ترقية", "auto_upgrade": "تطوير تلقائي", "quests": "مهام يومية",
     "wheel": "عجلة", "work": "شغل", "pills_auto": "تحويل حبوب تلقائي",
-    "military_auto": "انضمام عسكري",
+    "military_auto": "انضمام عسكري", "plan_step": "خطوة من خطة تطوير",
 }
 
 
@@ -974,6 +1106,15 @@ def schedule_periodic():
         "UPDATE accounts SET travel_destination='', travel_sent_at=NULL "
         "WHERE travel_sent_at IS NOT NULL AND travel_sent_at < %s",
         (stale_travel,))
+
+    # شبكة أمان لخطط التطوير: لو حساب عنده خطة شغّالة بس مفيش مهمة plan_step
+    # منتظرة ليه (مثلاً فشلت ٣ مرات وانقطعت السلسلة)، نرجّع نجدولها —
+    # الخطة دي مستقلة عن مفتاح "تشغيل/إيقاف" الحساب، فبنشتغل حتى لو موقوف
+    planning = db_all(
+        "SELECT id FROM accounts WHERE upgrade_plan IS NOT NULL AND token<>''")
+    for account in planning:
+        if _queue_if_free(account["id"], "plan_step"):
+            added += 1
 
     return added
 
@@ -1126,6 +1267,10 @@ select.field{cursor:pointer}
   border-right:2px solid var(--red);padding:6px 9px;border-radius:0 var(--r-sm) var(--r-sm) 0}
 .travel-badge{margin-top:9px;font-size:12px;color:var(--sand);background:rgba(217,164,65,.12);
   border-right:2px solid var(--sand);padding:6px 9px;border-radius:0 var(--r-sm) var(--r-sm) 0}
+.plan-badge{margin-top:9px;font-size:12px;color:var(--green-bright);background:var(--green-dim);
+  border-right:2px solid var(--green-bright);padding:6px 9px;border-radius:0 var(--r-sm) var(--r-sm) 0;
+  display:flex;align-items:center;gap:8px}
+.plan-badge .txt{flex:1}
 
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft);
   border-radius:var(--r-sm);overflow:hidden;margin:12px 0 10px}
@@ -1239,6 +1384,7 @@ const state = {
   accounts: [], logs: [], squads: [],
   selected: new Set(), squadFilter: '',
   countries: [], expandedCountry: null,
+  planSteps: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1370,6 +1516,12 @@ function cardHtml(a) {
 
     ${a.last_error ? `<div class="err-line">${esc(a.last_error)}</div>` : ''}
     ${a.travel ? `<div class="travel-badge">🚀 مسافر إلى ${esc(a.travel.destination)}${travelElapsed(a.travel.sent_at)}</div>` : ''}
+    ${a.upgrade_plan ? `<div class="plan-badge">
+      <span class="txt">📋 خطة تطوير: خطوة ${a.upgrade_plan.step_index}/${a.upgrade_plan.total_steps} —
+      ${esc(a.upgrade_plan.current_label)} (${a.upgrade_plan.done_in_step}/${a.upgrade_plan.step_count}) ·
+      باقي ${a.upgrade_plan.total_remaining} إجمالاً</span>
+      <button class="btn btn-sm btn-ghost" onclick="cancelPlan(${a.id})">إلغاء</button>
+    </div>` : ''}
 
     <div class="stats">
       <div class="stat">
@@ -1462,7 +1614,7 @@ function togglePick(id, on) {
 function renderPickState() {
   const n = state.selected.size;
   $('pick-count').textContent = n ? `${n} مختار` : 'مفيش اختيار';
-  ['btn-travel', 'btn-upgrade', 'btn-autoupgrade', 'btn-refresh']
+  ['btn-travel', 'btn-upgrade', 'btn-autoupgrade', 'btn-refresh', 'btn-plan']
     .forEach((id) => { $(id).disabled = n === 0; });
 }
 
@@ -1571,6 +1723,15 @@ async function saveProxy() {
   } catch (e) { toast(e.message, true); }
 }
 
+async function cancelPlan(id) {
+  if (!confirm('تلغي خطة التطوير للحساب ده؟')) return;
+  try {
+    await api(`/api/accounts/${id}/plan/cancel`, { method: 'POST' });
+    toast('الخطة اتلغت');
+    await loadState();
+  } catch (e) { toast(e.message, true); }
+}
+
 async function testProxy() {
   const id = $('px-id').value;
   const btn = $('px-test');
@@ -1586,6 +1747,78 @@ async function testProxy() {
     btn.textContent = 'اختبار الاتصال';
     loadState();
   }
+}
+
+function openPlanModal() {
+  if (!state.selected.size) return toast('اختار حسابات الأول', true);
+  state.planSteps = [];
+  $('plan-currency').innerHTML = Object.entries(window.CURRENCIES)
+    .map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('');
+  $('plan-perk').innerHTML = Object.entries(window.PERKS)
+    .map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join('');
+  $('plan-count').value = '';
+  renderPlanSteps();
+  openModal('modal-plan');
+}
+
+function addPlanStep() {
+  const perk = $('plan-perk').value;
+  const count = parseInt($('plan-count').value, 10);
+  if (!count || count <= 0) return toast('اكتب عدد أكبر من صفر', true);
+  if (count > 300) return toast('أقصى عدد للخطوة الواحدة 300', true);
+  const label = window.PERKS[perk]?.label || perk;
+  state.planSteps.push({ perk, count, label });
+  $('plan-count').value = '';
+  renderPlanSteps();
+}
+
+function removePlanStep(idx) {
+  state.planSteps.splice(idx, 1);
+  renderPlanSteps();
+}
+
+function movePlanStep(idx, dir) {
+  const target = idx + dir;
+  if (target < 0 || target >= state.planSteps.length) return;
+  [state.planSteps[idx], state.planSteps[target]] = [state.planSteps[target], state.planSteps[idx]];
+  renderPlanSteps();
+}
+
+function renderPlanSteps() {
+  const list = state.planSteps;
+  if (!list.length) {
+    $('plan-steps').innerHTML = '<div class="province" style="color:var(--muted)">لسه مفيش خطوات — ضيف واحدة فوق</div>';
+    return;
+  }
+  $('plan-steps').innerHTML = list.map((s, i) => `
+    <div class="province" style="display:flex;align-items:center;gap:8px">
+      <span style="color:var(--sand);font-family:var(--font-mono);font-size:12px;flex-shrink:0">${i + 1}</span>
+      <span style="flex:1">${s.count} × ${esc(s.label)}</span>
+      <button class="btn btn-sm btn-ghost" onclick="movePlanStep(${i}, -1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+      <button class="btn btn-sm btn-ghost" onclick="movePlanStep(${i}, 1)" ${i === list.length - 1 ? 'disabled' : ''}>↓</button>
+      <button class="btn btn-sm btn-danger" onclick="removePlanStep(${i})">حذف</button>
+    </div>`).join('');
+}
+
+async function startPlan() {
+  if (!state.planSteps.length) return toast('ضيف خطوة واحدة على الأقل', true);
+  const ids = [...state.selected];
+  try {
+    const r = await api('/api/command', {
+      method: 'POST',
+      body: JSON.stringify({
+        kind: 'upgrade_plan', account_ids: ids,
+        payload: {
+          steps: state.planSteps.map((s) => ({ perk: s.perk, count: s.count })),
+          currency: $('plan-currency').value,
+          spread: $('plan-spread').checked,
+        },
+      }),
+    });
+    toast(r.note);
+    closeModals();
+    setTimeout(loadState, 1500);
+  } catch (e) { toast(e.message, true); }
 }
 
 async function openTravelModal() {
@@ -1707,11 +1940,13 @@ function bind() {
   $('btn-add').onclick = () => openAccountModal();
   $('acc-save').onclick = saveAccount;
   $('px-save').onclick = saveProxy;
+  $('plan-go').onclick = startPlan;
   $('px-test').onclick = testProxy;
   $('tr-search').oninput = renderCountries;
 
   $('btn-travel').onclick = openTravelModal;
   $('btn-upgrade').onclick = () => runGroup('upgrade');
+  $('btn-plan').onclick = openPlanModal;
   $('btn-autoupgrade').onclick = () => runGroup('auto_upgrade');
   $('btn-refresh').onclick = () => runGroup('refresh', {}, false);
 
@@ -1826,6 +2061,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="topbar-spacer"></div>
       <button class="btn btn-go btn-sm" id="btn-travel" disabled>الدول والسفر</button>
       <button class="btn btn-sm" id="btn-upgrade" disabled>ترقية</button>
+      <button class="btn btn-sm" id="btn-plan" disabled>خطة تطوير</button>
       <button class="btn btn-sm" id="btn-autoupgrade" disabled>تطوير تلقائي</button>
       <button class="btn btn-sm" id="btn-refresh" disabled>تحديث البيانات</button>
       <button class="btn btn-primary btn-sm" id="btn-add">+ حساب</button>
@@ -1908,6 +2144,47 @@ INDEX_HTML = """<!DOCTYPE html>
       <button class="btn btn-primary" id="px-save">حفظ</button>
       <button class="btn btn-go" id="px-test">اختبار الاتصال</button>
       <button class="btn btn-ghost" data-close>إغلاق</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="modal-plan">
+  <div class="modal">
+    <div class="modal-head"><h3>خطة تطوير بالتتابع</h3></div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label for="plan-currency">العملة</label>
+        <select class="field" id="plan-currency" style="width:100%"></select>
+      </div>
+
+      <div class="form-row">
+        <label>أضف خطوة (مهارة + عدد مرات)</label>
+        <div style="display:flex;gap:6px">
+          <select class="field" id="plan-perk" style="flex:1"></select>
+          <input class="field" id="plan-count" type="number" min="1" max="300"
+                 placeholder="العدد" style="width:88px">
+          <button class="btn btn-sm btn-primary" onclick="addPlanStep()">إضافة</button>
+        </div>
+        <div class="hint">
+          مثال: أضف "٥٠ × العالِم" ثم أضف "٥٠ × الثكنات" — هينفّذوا بالترتيب ده بالظبط.<br>
+          ملحوظة: اللعبة بتسمح بترقية واحدة بس في نفس الوقت، فكل ترقية بتستنى
+          الوقت الحقيقي اللي اللعبة بتحدده (مش وقت ثابت) — ممكن ٥٠ ترقية تاخد
+          أيام حسب مستوى الحساب، ودي حاجة من اللعبة نفسها مش من البوت.
+        </div>
+      </div>
+
+      <div class="province-list" id="plan-steps" style="max-height:200px;margin-top:8px"></div>
+
+      <div class="form-row" style="margin-top:14px">
+        <label class="toggle" style="width:100%">
+          <input type="checkbox" id="plan-spread" checked>
+          <span>وزّع الحسابات على وقت لو مختار أكتر من حساب</span>
+        </label>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="plan-go">ابدأ الخطة</button>
+      <button class="btn btn-ghost" data-close>إلغاء</button>
     </div>
   </div>
 </div>
@@ -2042,6 +2319,28 @@ def healthz():
 
 
 # ── الحالة ───────────────────────────────────────────────
+def _plan_summary(plan):
+    """بيحوّل بيانات الخطة الخام لملخّص واضح للواجهة، أو None لو مفيش خطة."""
+    if not plan or not isinstance(plan, dict):
+        return None
+    steps = plan.get("steps") or []
+    idx = plan.get("step_index", 0)
+    if idx >= len(steps):
+        return None
+    step = steps[idx]
+    total_remaining = sum(s["count"] for s in steps[idx + 1:]) + \
+        (step["count"] - plan.get("done_in_step", 0))
+    return {
+        "current_perk": step["perk"],
+        "current_label": PERKS.get(step["perk"], {}).get("label", step["perk"]),
+        "done_in_step": plan.get("done_in_step", 0),
+        "step_count": step["count"],
+        "step_index": idx + 1,
+        "total_steps": len(steps),
+        "total_remaining": total_remaining,
+    }
+
+
 def _public_account(row):
     """بنشيل التوكن وكلمة سر البروكسي قبل ما نبعت البيانات للواجهة."""
     return {
@@ -2054,6 +2353,7 @@ def _public_account(row):
         "auto_military": row["auto_military"],
         "military_joined_until": row["military_joined_until"].isoformat()
                                   if row["military_joined_until"] else None,
+        "upgrade_plan": _plan_summary(row["upgrade_plan"]),
         "proxy": {
             "type": row["proxy_type"], "note": row["proxy_note"],
             "line_masked": (f"{row['proxy_host']}:{row['proxy_port']}"
@@ -2204,6 +2504,20 @@ def api_delete_account(account_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/accounts/<int:account_id>/plan/cancel", methods=["POST"])
+@login_required
+def api_cancel_plan(account_id):
+    account = get_account(account_id)
+    if not account:
+        return jsonify({"ok": False, "error": "الحساب مش موجود"}), 404
+    db_execute("UPDATE accounts SET upgrade_plan=NULL WHERE id=%s", (account_id,))
+    db_execute(
+        "DELETE FROM tasks WHERE account_id=%s AND kind='plan_step' AND status='pending'",
+        (account_id,))
+    add_log("خطة التطوير اتلغت", "warn", account_id)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/accounts/<int:account_id>/proxy")
 @login_required
 def api_get_proxy(account_id):
@@ -2268,6 +2582,10 @@ def api_command():
     """
     data = request.get_json(silent=True) or {}
     kind = (data.get("kind") or "").strip()
+
+    if kind == "upgrade_plan":
+        return _handle_upgrade_plan(data)
+
     if kind not in HANDLERS:
         return jsonify({"ok": False, "error": "أمر غير معروف"}), 400
 
@@ -2292,6 +2610,69 @@ def api_command():
 
 _provinces_cache = {"data": None, "at": 0}
 _countries_cache = {"data": None, "at": 0}
+
+
+def _handle_upgrade_plan(data):
+    """
+    خطة تطوير بالتتابع: كذا خطوة، كل خطوة (مهارة + عدد مرات)، بتتنفذ بالكامل
+    قبل ما اللي بعدها تبدأ. مثال: [{"perk":"scientist","count":50},
+    {"perk":"barracks","count":50}] = ٥٠ ترقية علم، وبعدين ٥٠ ترقية ثكنات.
+    """
+    targets = _resolve_targets(data)
+    if not targets:
+        return jsonify({"ok": False, "error": "مفيش حسابات مختارة (أو مفيش توكن ليها)"}), 400
+
+    payload = data.get("payload") or {}
+    currency = (payload.get("currency") or "money").strip()
+    if currency not in CURRENCIES:
+        return jsonify({"ok": False, "error": "عملة غير معروفة"}), 400
+
+    raw_steps = payload.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        return jsonify({"ok": False, "error": "لازم تضيف خطوة واحدة على الأقل"}), 400
+
+    steps = []
+    for item in raw_steps:
+        if not isinstance(item, dict):
+            return jsonify({"ok": False, "error": "شكل الخطوة غلط"}), 400
+        perk = (item.get("perk") or "").strip()
+        if perk not in PERKS:
+            return jsonify({"ok": False, "error": f"مهارة غير معروفة: {perk}"}), 400
+        try:
+            count = int(item.get("count"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "العدد لازم يكون رقم"}), 400
+        if count <= 0 or count > MAX_PLAN_STEP_COUNT:
+            return jsonify({
+                "ok": False,
+                "error": f"العدد في كل خطوة لازم يكون بين ١ و {MAX_PLAN_STEP_COUNT}",
+            }), 400
+        steps.append({"perk": perk, "count": count})
+
+    total_per_account = sum(s["count"] for s in steps)
+    if total_per_account > MAX_PLAN_TOTAL_COUNT:
+        return jsonify({
+            "ok": False,
+            "error": f"إجمالي الخطة لكل حساب كبير قوي — أقصى حد {MAX_PLAN_TOTAL_COUNT} ترقية",
+        }), 400
+
+    spread = bool(payload.get("spread", True)) and len(targets) > 1
+    delay = 0
+    for account_id in targets:
+        plan = {"steps": steps, "currency": currency, "step_index": 0, "done_in_step": 0}
+        db_execute("UPDATE accounts SET upgrade_plan=%s::jsonb WHERE id=%s",
+                  (json.dumps(plan), account_id))
+        queue_task(account_id, "plan_step", delay_seconds=delay)
+        if spread:
+            delay += random.randint(GROUP_SPREAD_MIN, GROUP_SPREAD_MAX)
+
+    steps_desc = " ← ".join(f"{s['count']}×{PERKS[s['perk']]['label']}" for s in steps)
+    note = (f"خطة تطوير بدأت على {len(targets)} حساب: {steps_desc}. "
+           f"هتمشي في الخلفية حسب وقت الترقية الحقيقي في اللعبة — مش وقت ثابت.")
+    add_log(note, "info")
+
+    threading.Thread(target=run_tick, args=("command",), daemon=True).start()
+    return jsonify({"ok": True, "queued": len(targets), "note": note})
 
 
 def _fetch_provinces_raw():
