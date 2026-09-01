@@ -213,8 +213,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     auto_military BOOLEAN NOT NULL DEFAULT FALSE,
     military_joined_until TIMESTAMPTZ,
     upgrade_plan  JSONB,
+    feature_fail_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
 
-    proxy_type    TEXT NOT NULL DEFAULT 'http',
+    proxy_type    TEXT NOT NULL DEFAULT 'socks5',
     proxy_host    TEXT NOT NULL DEFAULT '',
     proxy_port    TEXT NOT NULL DEFAULT '',
     proxy_user    TEXT NOT NULL DEFAULT '',
@@ -277,6 +278,7 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_military BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS military_joined_until TIMESTAMPTZ",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS upgrade_plan JSONB",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS feature_fail_counts JSONB NOT NULL DEFAULT '{}'::jsonb",
 ]
 
 
@@ -362,7 +364,7 @@ def build_proxies(account):
     port = str(account.get("proxy_port") or "").strip()
     if not host or not port:
         return None
-    scheme = (account.get("proxy_type") or "http").strip() or "http"
+    scheme = (account.get("proxy_type") or "socks5").strip() or "socks5"
     user = (account.get("proxy_user") or "").strip()
     pwd = (account.get("proxy_pass") or "").strip()
     auth = f"{user}:{pwd}@" if user else ""
@@ -787,28 +789,6 @@ def task_residence(account, payload):
     return f"طلب إقامة لـ {country_name}" if country_name else "طلب الإقامة اترسل"
 
 
-def task_auto_upgrade(account, payload):
-    """التطوير التلقائي بتاع اللعبة نفسها — بيشتغل ٢٤ ساعة وبنجدّده لوحدنا."""
-    perk = payload.get("perk") or account["perk"]
-    currency = payload.get("currency") or account["currency"]
-    skill_key = PERK_KEYS.get(perk)
-    if not skill_key:
-        raise GameError(f"مهارة غير معروفة: {perk}")
-
-    resp = client_for(account).toggle_auto_skill(skill_key, currency)
-    label = PERKS[perk]["label"]
-
-    if not resp.get("active", True):
-        db_execute("UPDATE accounts SET auto_upgrade=FALSE, upgrade_until=NULL WHERE id=%s",
-                   (account["id"],))
-        return f"اللعبة وقّفت التطوير التلقائي ({label}) — الشرط أو الرصيد مش مكفّي"
-
-    until = _parse_time(resp.get("until")) or (now() + timedelta(hours=24))
-    db_execute("UPDATE accounts SET upgrade_until=%s, auto_upgrade=TRUE WHERE id=%s",
-               (until, account["id"]))
-    return f"التطوير التلقائي شغّال على {label}"
-
-
 def task_quests(account, payload):
     client = client_for(account)
     claimed = 0
@@ -967,7 +947,6 @@ HANDLERS = {
     "travel": task_travel,
     "visa": task_visa,
     "residence": task_residence,
-    "auto_upgrade": task_auto_upgrade,
     "quests": task_quests,
     "wheel": task_wheel,
     "work": task_work,
@@ -978,10 +957,51 @@ HANDLERS = {
 
 KIND_LABELS = {
     "refresh": "تحديث", "travel": "سفر", "visa": "طلب فيزا", "residence": "طلب إقامة",
-    "auto_upgrade": "تطوير تلقائي", "quests": "مهام يومية",
+    "quests": "مهام يومية",
     "wheel": "عجلة", "work": "شغل", "pills_auto": "تحويل حبوب تلقائي",
     "military_auto": "انضمام عسكري", "plan_step": "خطوة من خطة تطوير",
 }
+
+
+# لما ميزة دورية (مش أمر لمرة واحدة زي السفر) تفشل باستمرار — غالباً معناها
+# إن مسار API بتاعها غلط أو اتغيّر في اللعبة — نوقفها تلقائي بدل ما تفضل
+# تحاول للأبد وتضرب اللعبة والقاعدة بطلبات فاشلة كل نبضة
+_AUTO_FEATURE_TOGGLE = {
+    "quests": "auto_quests", "wheel": "auto_wheel", "work": "auto_work",
+    "military_auto": "auto_military", "pills_auto": "auto_pills",
+}
+FEATURE_FAIL_LIMIT = _int("FEATURE_FAIL_LIMIT", 3)
+
+
+def _note_feature_failure(account, kind, error_text):
+    toggle_field = _AUTO_FEATURE_TOGGLE.get(kind)
+    if not toggle_field:
+        return
+    counts = dict(account.get("feature_fail_counts") or {})
+    counts[kind] = counts.get(kind, 0) + 1
+
+    if counts[kind] >= FEATURE_FAIL_LIMIT:
+        counts[kind] = 0
+        db_execute(f"UPDATE accounts SET {toggle_field}=FALSE, feature_fail_counts=%s::jsonb "
+                  "WHERE id=%s", (json.dumps(counts), account["id"]))
+        add_log(
+            f"{account_title(account)}: {KIND_LABELS.get(kind, kind)} اتوقفت تلقائي بعد "
+            f"{FEATURE_FAIL_LIMIT} محاولات فاشلة متتالية — المشكلة: {error_text}",
+            "error", account["id"])
+    else:
+        db_execute("UPDATE accounts SET feature_fail_counts=%s::jsonb WHERE id=%s",
+                  (json.dumps(counts), account["id"]))
+
+
+def _note_feature_success(account, kind):
+    toggle_field = _AUTO_FEATURE_TOGGLE.get(kind)
+    if not toggle_field:
+        return
+    counts = dict(account.get("feature_fail_counts") or {})
+    if counts.get(kind):
+        counts[kind] = 0
+        db_execute("UPDATE accounts SET feature_fail_counts=%s::jsonb WHERE id=%s",
+                  (json.dumps(counts), account["id"]))
 
 
 def run_task(task):
@@ -1010,6 +1030,7 @@ def run_task(task):
             "UPDATE tasks SET status='done', result=%s, attempts=attempts+1 WHERE id=%s",
             ((message or "تم")[:300], task["id"]))
         mark_ok(account, f"{title}: {message}" if message else None)
+        _note_feature_success(account, task["kind"])
 
     except TokenInvalid as e:
         db_execute(
@@ -1030,6 +1051,7 @@ def run_task(task):
             db_execute("UPDATE tasks SET status='failed', attempts=%s, result=%s WHERE id=%s",
                        (attempts, str(e)[:300], task["id"]))
             mark_error(account, f"{title}: {e}")
+            _note_feature_failure(account, task["kind"], str(e))
 
     except Exception as e:
         log.exception("خطأ غير متوقع في المهمة %s", task["id"])
@@ -1037,6 +1059,7 @@ def run_task(task):
             "UPDATE tasks SET status='failed', attempts=attempts+1, result=%s WHERE id=%s",
             (f"{type(e).__name__}: {e}"[:300], task["id"]))
         mark_error(account, f"{title}: خطأ داخلي — {type(e).__name__}")
+        _note_feature_failure(account, task["kind"], f"{type(e).__name__}: {e}")
 
 
 def _queue_if_free(account_id, kind, min_gap_minutes=0):
@@ -1064,12 +1087,6 @@ def schedule_periodic():
         last_seen = account.get("last_seen")
         if (last_seen is None or last_seen < stale_before) and _queue_if_free(aid, "refresh"):
             added += 1
-
-        if account.get("auto_upgrade"):
-            until = account.get("upgrade_until")
-            if (until is None or until <= now() + timedelta(minutes=5)) \
-                    and _queue_if_free(aid, "auto_upgrade"):
-                added += 1
 
         if account.get("auto_quests") and _queue_if_free(aid, "quests", 60):
             added += 1
@@ -1425,7 +1442,6 @@ function renderChips(s) {
     <span class="chip">الحسابات <b>${s.total}</b></span>
     <span class="chip on">شغّال <b>${s.running}</b></span>
     ${s.errors ? `<span class="chip bad">أخطاء <b>${s.errors}</b></span>` : ''}
-    ${s.pending_tasks ? `<span class="chip wait">في الطابور <b>${s.pending_tasks}</b></span>` : ''}
   `;
 }
 
@@ -1494,7 +1510,7 @@ function cardHtml(a) {
         <svg class="status-star" viewBox="0 0 100 100" aria-hidden="true">${STAR}</svg>
       </div>
       <div class="card-title">
-        <h3>${esc(a.label || 'بدون اسم')}</h3>
+        <h3>${esc(a.label || a.game_name || 'حساب جديد')}</h3>
         <div class="sub">
           ${a.game_name ? esc(a.game_name) : 'لسه مجابش بيانات'}
           <span class="squad-tag">${esc(a.squad)}</span>
@@ -1549,7 +1565,6 @@ function cardHtml(a) {
     </div>
 
     <div class="toggles">
-      ${toggle('auto_upgrade', 'تطوير تلقائي')}
       ${toggle('auto_quests', 'مهام يومية')}
       ${toggle('auto_wheel', 'العجلة')}
       ${toggle('auto_work', 'الشغل')}
@@ -1604,7 +1619,7 @@ function togglePick(id, on) {
 function renderPickState() {
   const n = state.selected.size;
   $('pick-count').textContent = n ? `${n} مختار` : 'مفيش اختيار';
-  ['btn-travel', 'btn-autoupgrade', 'btn-refresh', 'btn-plan']
+  ['btn-travel', 'btn-refresh', 'btn-plan']
     .forEach((id) => { $(id).disabled = n === 0; });
 }
 
@@ -1657,28 +1672,32 @@ function openAccountModal(id = null) {
   $('acc-squad').value = account ? account.squad : 'المجموعة الأولى';
   $('acc-token').value = '';
   $('acc-token').placeholder = account ? 'سيبه فاضي لو مش عايز تغيّره' : 'الصق التوكن هنا';
+  $('acc-token-hint').style.display = account ? 'none' : 'block';
   openModal('modal-account');
 }
 
 async function saveAccount() {
   const id = $('acc-id').value;
+  const token = $('acc-token').value.trim();
   const payload = {
     label: $('acc-label').value.trim(),
     squad: $('acc-squad').value.trim() || 'المجموعة الأولى',
   };
-  const token = $('acc-token').value.trim();
   if (token) payload.token = token;
-  if (!payload.label) return toast('اكتب اسم للحساب', true);
+
+  if (!id && !token) return toast('الصق التوكن الأول', true);
+
   try {
     if (id) {
       await api(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
       toast('التعديلات اتحفظت');
     } else {
       await api('/api/accounts', { method: 'POST', body: JSON.stringify(payload) });
-      toast('الحساب اتضاف');
+      toast('الحساب اتضاف — بنجيب بياناته دلوقتي');
     }
     closeModals();
     await loadState();
+    if (!id) setTimeout(loadState, 3000);  // نلحق تحديث البيانات لما تجي
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1686,7 +1705,6 @@ async function openProxyModal(id) {
   const a = state.accounts.find((x) => x.id === id);
   if (!a) return;
   $('px-id').value = id;
-  $('px-type').value = a.proxy.type || 'http';
   $('px-note').value = a.proxy.note || '';
   $('px-line').value = '…جاري التحميل';
   openModal('modal-proxy');
@@ -1702,7 +1720,7 @@ async function openProxyModal(id) {
 async function saveProxy() {
   const id = $('px-id').value;
   const payload = {
-    proxy_type: $('px-type').value,
+    proxy_type: 'socks5',
     proxy_line: $('px-line').value.trim(),
     proxy_note: $('px-note').value.trim(),
   };
@@ -1978,7 +1996,6 @@ function bind() {
 
   $('btn-travel').onclick = openTravelModal;
   $('btn-plan').onclick = openPlanModal;
-  $('btn-autoupgrade').onclick = () => runGroup('auto_upgrade');
   $('btn-refresh').onclick = () => runGroup('refresh', {}, false);
 
   $('btn-select-all').onclick = () => {
@@ -2092,7 +2109,6 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="topbar-spacer"></div>
       <button class="btn btn-go btn-sm" id="btn-travel" disabled>الدول والسفر</button>
       <button class="btn btn-sm" id="btn-plan" disabled>خطة تطوير</button>
-      <button class="btn btn-sm" id="btn-autoupgrade" disabled>تطوير تلقائي</button>
       <button class="btn btn-sm" id="btn-refresh" disabled>تحديث البيانات</button>
       <button class="btn btn-primary btn-sm" id="btn-add">+ حساب</button>
     </div>
@@ -2120,19 +2136,22 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="modal-body">
       <input type="hidden" id="acc-id">
       <div class="form-row">
-        <label for="acc-label">اسم الحساب عندك</label>
-        <input class="field" id="acc-label" placeholder="مثلاً: الحساب الأساسي">
+        <label for="acc-token">التوكن</label>
+        <input class="field" id="acc-token" dir="ltr" placeholder="الصق التوكن هنا">
+        <div class="hint" id="acc-token-hint">
+          بيتخزّن في قاعدة البيانات ومبيظهرش تاني. جيب بياناته من اللعبة على طول
+          بعد الحفظ — مش محتاج تكتب اسم أو تعمل تحديث يدوي.
+        </div>
+      </div>
+      <div class="form-row">
+        <label for="acc-label">اسم تحب تنده بيه عليه (اختياري)</label>
+        <input class="field" id="acc-label" placeholder="لو سبته فاضي، هناخد اسمه من اللعبة">
       </div>
       <div class="form-row">
         <label for="acc-squad">المجموعة</label>
         <input class="field" id="acc-squad" list="squad-options" placeholder="المجموعة الأولى">
         <datalist id="squad-options"></datalist>
         <div class="hint">الحسابات اللي في نفس المجموعة بتتحرّك مع بعض بأمر واحد.</div>
-      </div>
-      <div class="form-row">
-        <label for="acc-token">التوكن</label>
-        <input class="field" id="acc-token" placeholder="سيبه فاضي لو مش عايز تغيّره">
-        <div class="hint">بيتخزّن في قاعدة البيانات ومبيظهرش تاني في الواجهة.</div>
       </div>
     </div>
     <div class="modal-foot">
@@ -2144,25 +2163,16 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <div class="overlay" id="modal-proxy">
   <div class="modal">
-    <div class="modal-head"><h3>بروكسي الحساب</h3></div>
+    <div class="modal-head"><h3>بروكسي الحساب (SOCKS5)</h3></div>
     <div class="modal-body">
       <input type="hidden" id="px-id">
-      <div class="form-row">
-        <label for="px-type">النوع</label>
-        <select class="field" id="px-type" style="width:100%">
-          <option value="http">HTTP</option>
-          <option value="https">HTTPS</option>
-          <option value="socks5">SOCKS5</option>
-          <option value="socks5h">SOCKS5H</option>
-        </select>
-      </div>
       <div class="form-row">
         <label for="px-line">بيانات البروكسي</label>
         <input class="field" id="px-line" dir="ltr"
                placeholder="عنوان:منفذ:يوزر:باسورد">
         <div class="hint">
           الصق السطر زي ما هو، مثال: <code dir="ltr">108.165.3.251:5382:ozyytuow:0tdkwosbhga2</code><br>
-          لو مفيش يوزر وباسورد، اكتب العنوان والمنفذ بس.
+          لو مفيش يوزر وباسورد، اكتب العنوان والمنفذ بس. البروكسي دايماً SOCKS5.
         </div>
       </div>
       <div class="form-row">
@@ -2279,6 +2289,17 @@ def same_secret(given, expected):
     )
 
 
+@app.errorhandler(psycopg2.OperationalError)
+def _handle_db_hiccup(e):
+    """
+    القاعدة المجانية أحياناً بتقطع الاتصال فجأة (SSL error / EOF) — ده عادي
+    ومش لازم يكسر الصفحة. بنرجّع رسالة واضحة والـ pool بيتبني تاني لوحده في
+    الطلب اللي بعده (الكود ده متعمول في connection() بالفعل).
+    """
+    log.error("القاعدة قطعت فجأة: %s", e)
+    return jsonify({"ok": False, "error": "القاعدة قطعت مؤقتاً — جرّب تاني بعد شوية"}), 503
+
+
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -2376,7 +2397,7 @@ def _public_account(row):
         "id": row["id"], "label": row["label"], "squad": row["squad"],
         "enabled": row["enabled"], "has_token": bool(row["token"]),
         "perk": row["perk"], "currency": row["currency"],
-        "auto_upgrade": row["auto_upgrade"], "auto_quests": row["auto_quests"],
+        "auto_quests": row["auto_quests"],
         "auto_wheel": row["auto_wheel"], "auto_work": row["auto_work"],
         "auto_pills": row["auto_pills"], "pills_limit": row["pills_limit"],
         "auto_military": row["auto_military"],
@@ -2405,7 +2426,6 @@ def _public_account(row):
         },
         "status": row["status"], "last_error": row["last_error"],
         "last_seen": row["last_seen"].isoformat() if row["last_seen"] else None,
-        "upgrade_until": row["upgrade_until"].isoformat() if row["upgrade_until"] else None,
         "work_until": row["work_until"].isoformat() if row["work_until"] else None,
     }
 
@@ -2415,7 +2435,6 @@ def _public_account(row):
 def api_state():
     accounts = [_public_account(r) for r in list_accounts()]
     logs = db_all("SELECT id, account_id, level, message, ts FROM logs ORDER BY id DESC LIMIT 60")
-    pending = db_one("SELECT COUNT(*) AS c FROM tasks WHERE status='pending'")
     return jsonify({
         "ok": True,
         "accounts": accounts,
@@ -2426,14 +2445,13 @@ def api_state():
             "total": len(accounts),
             "running": sum(1 for a in accounts if a["enabled"]),
             "errors": sum(1 for a in accounts if a["status"] == "error"),
-            "pending_tasks": pending["c"] if pending else 0,
         },
     })
 
 
 # ── إدارة الحسابات ───────────────────────────────────────
 _EDITABLE_TEXT = {"label", "token", "squad", "perk", "currency", "proxy_type", "proxy_note"}
-_EDITABLE_BOOL = {"enabled", "auto_upgrade", "auto_quests", "auto_wheel", "auto_work",
+_EDITABLE_BOOL = {"enabled", "auto_quests", "auto_wheel", "auto_work",
                   "auto_pills", "auto_military"}
 
 
@@ -2441,18 +2459,19 @@ _EDITABLE_BOOL = {"enabled", "auto_upgrade", "auto_quests", "auto_wheel", "auto_
 @login_required
 def api_create_account():
     data = request.get_json(silent=True) or {}
-    label = (data.get("label") or "").strip()
-    if not label:
-        return jsonify({"ok": False, "error": "اكتب اسم للحساب"}), 400
     token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"ok": False, "error": "الصق التوكن الأول"}), 400
+    label = (data.get("label") or "").strip()  # اختياري — هيتجاب من اللعبة تلقائي
 
     row = db_execute(
         "INSERT INTO accounts (label, token, squad, sort_order) "
         "VALUES (%s,%s,%s,(SELECT COALESCE(MAX(sort_order),0)+1 FROM accounts)) RETURNING id",
         (label, token, (data.get("squad") or "المجموعة الأولى").strip()), returning=True)
-    add_log(f"اتضاف حساب جديد: {label}", "ok", row["id"])
-    if token:
-        queue_task(row["id"], "refresh")
+    add_log(f"اتضاف حساب جديد {('— ' + label) if label else ''}", "ok", row["id"])
+    queue_task(row["id"], "refresh")
+    # منستناش النبضة الجاية — نجيب البيانات فوراً
+    threading.Thread(target=run_tick, args=("account_added",), daemon=True).start()
     return jsonify({"ok": True, "id": row["id"]})
 
 
@@ -2515,9 +2534,7 @@ def api_update_account(account_id):
     if data.get("token"):
         db_execute("UPDATE accounts SET status='idle', last_error='' WHERE id=%s", (account_id,))
         queue_task(account_id, "refresh")
-
-    if data.get("auto_upgrade") and not account["auto_upgrade"]:
-        queue_task(account_id, "auto_upgrade")
+        threading.Thread(target=run_tick, args=("token_updated",), daemon=True).start()
 
     return jsonify({"ok": True})
 
