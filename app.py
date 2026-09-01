@@ -31,7 +31,7 @@ import psycopg2
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import (
-    Flask, Response, jsonify, redirect, render_template_string,
+    Flask, Response, jsonify, make_response, redirect, render_template_string,
     request, session, url_for,
 )
 from psycopg2 import pool as pgpool
@@ -93,6 +93,7 @@ PERKS = {
     "supply_drill":   {"key": "ikmal_talim",      "label": "الإمداد والتدريب"},
 }
 PERK_KEYS = {k: v["key"] for k, v in PERKS.items()}
+PERK_CYCLE = list(PERKS.keys())  # نفس ترتيب المربعات في الكارت — بيتلف عليه لما نوصل الهدف
 
 CURRENCIES = {"money": "المال", "diamond": "الماس"}
 
@@ -210,6 +211,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     auto_work     BOOLEAN NOT NULL DEFAULT FALSE,
     auto_pills    BOOLEAN NOT NULL DEFAULT FALSE,
     pills_limit   BIGINT NOT NULL DEFAULT 2500,
+    perk_progress INTEGER NOT NULL DEFAULT 0,
+    perk_target   INTEGER,
     auto_military BOOLEAN NOT NULL DEFAULT FALSE,
     military_joined_until TIMESTAMPTZ,
     upgrade_plan  JSONB,
@@ -279,6 +282,8 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS military_joined_until TIMESTAMPTZ",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS upgrade_plan JSONB",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS feature_fail_counts JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_progress INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_target INTEGER",
 ]
 
 
@@ -821,12 +826,26 @@ def task_auto_perk(account, payload):
         queue_task(account["id"], "auto_perk", delay_seconds=e.retry_after)
         return None
 
+    progress = (account.get("perk_progress") or 0) + 1
+    target = account.get("perk_target")
+    label = PERKS[perk]["label"]
+
+    if target and progress >= target:
+        next_perk = PERK_CYCLE[(PERK_CYCLE.index(perk) + 1) % len(PERK_CYCLE)]
+        db_execute("UPDATE accounts SET perk=%s, perk_progress=0 WHERE id=%s",
+                  (next_perk, account["id"]))
+        message = f"{label} خلصت ({progress}/{target}) — بدأنا {PERKS[next_perk]['label']}"
+    else:
+        db_execute("UPDATE accounts SET perk_progress=%s WHERE id=%s",
+                  (progress, account["id"]))
+        message = f"تطوير {label} ({progress}{f'/{target}' if target else ''})"
+
     try:
         wait_s = skill_cooldown_seconds(client.profile()) or 65
     except Exception:
         wait_s = 65
     queue_task(account["id"], "auto_perk", delay_seconds=wait_s)
-    return f"تطوير {PERKS[perk]['label']} — هيتجدد لوحده"
+    return message
 
 
 def task_quests(account, payload):
@@ -1346,6 +1365,8 @@ select.field{cursor:pointer}
 .skill.active{border-color:var(--sand);border-width:1.5px;background:rgba(217,164,65,.08)}
 .skill.active .v{color:var(--sand)}
 .skill.active .k{color:var(--sand)}
+.skill-count{display:block;font-family:var(--font-mono);font-size:9px;
+  color:var(--green-bright);margin-top:1px;direction:ltr}
 
 .toggles{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}
 .toggle{display:flex;align-items:center;gap:7px;padding:7px 9px;background:var(--bg-raise);
@@ -1473,6 +1494,7 @@ function toast(message, isError = false) {
 async function loadState() {
   try {
     const data = await api('/api/state');
+    notifyPerkChanges(state.accounts, data.accounts);
     state.accounts = data.accounts;
     state.logs = data.logs;
     state.squads = data.squads;
@@ -1485,6 +1507,26 @@ async function loadState() {
     renderPickState();
   } catch (e) {
     if (String(e.message).includes('تسجّل دخول')) location.href = '/login';
+  }
+}
+
+// بيقارن العدّاد القديم بالجديد لكل حساب — من غير أي طلب إضافي للسيرفر —
+// وبيطلع تنبيه بس لما ترقية فعلاً تحصل (مش على فاضي كل ٨ ثواني)
+function notifyPerkChanges(oldAccounts, newAccounts) {
+  const oldById = new Map(oldAccounts.map((a) => [a.id, a]));
+  for (const a of newAccounts) {
+    const before = oldById.get(a.id);
+    if (!before) continue;
+
+    if (before.perk === a.perk && a.perk_progress > before.perk_progress) {
+      const label = window.PERKS[a.perk]?.label || a.perk;
+      const target = a.perk_target ? `/${a.perk_target}` : '';
+      toast(`✅ ${a.label || a.game_name || 'حساب'}: اتطوّرت ${label} (${a.perk_progress}${target})`);
+    } else if (before.perk !== a.perk && before.perk_target) {
+      const oldLabel = window.PERKS[before.perk]?.label || before.perk;
+      const newLabel = window.PERKS[a.perk]?.label || a.perk;
+      toast(`🎯 ${a.label || a.game_name || 'حساب'}: خلصت ${oldLabel} وبدأت ${newLabel}`);
+    }
   }
 }
 
@@ -1531,12 +1573,19 @@ function cardHtml(a) {
   if (a.enabled && a.status !== 'error') classes.push('is-running');
   if (a.status === 'error') classes.push('is-error');
 
-  const skill = (key, label) => `
-    <div class="skill ${a.perk === key ? 'active' : ''}" role="button" tabindex="0"
+  const skill = (key, label) => {
+    const isActive = a.perk === key;
+    const counter = isActive
+      ? `<span class="skill-count">${a.perk_progress}${a.perk_target ? '/' + a.perk_target : ''}</span>`
+      : '';
+    return `
+    <div class="skill ${isActive ? 'active' : ''}" role="button" tabindex="0"
          onclick="patchAccount(${a.id}, {perk: '${key}'})">
       <span class="k">${label}</span>
       <span class="v">${esc(a.skills[key])}</span>
+      ${counter}
     </div>`;
+  };
 
   const toggle = (field, label) => `
     <label class="toggle ${a[field] ? 'on' : ''}">
@@ -1604,7 +1653,15 @@ function cardHtml(a) {
       ${skill('scientist', 'علم')}
       ${skill('supply_drill', 'إمداد')}
     </div>
-    <div class="hint" style="margin:-4px 0 8px">دوس على مهارة تختارها — لو الحساب "شغّال" هتتطور باستمرار لوحدها</div>
+    <div class="hint" style="margin:-4px 0 4px">دوس على مهارة تختارها — لو الحساب "شغّال" هتتطور باستمرار لوحدها</div>
+    <div class="proxy-line" style="flex-wrap:wrap;row-gap:6px;margin-bottom:8px">
+      <span class="dot" style="background:var(--green-bright)"></span>
+      <span style="font-size:11px;color:var(--muted);white-space:nowrap">هدف المهارة الحالية</span>
+      <input class="field" type="number" min="1" value="${a.perk_target || ''}" placeholder="بلا نهاية"
+             style="width:70px;padding:5px 7px;font-size:11.5px;margin-inline-start:auto"
+             onchange="patchAccount(${a.id}, {perk_target: this.value ? parseInt(this.value) : null})">
+      <div class="hint" style="width:100%;margin:0">لما توصل للهدف، بينتقل تلقائي للمهارة اللي بعدها في الترتيب</div>
+    </div>
 
     <div class="selects">
       <select class="field" style="width:100%" onchange="patchAccount(${a.id}, {currency: this.value})">
@@ -2089,6 +2146,11 @@ setInterval(loadState, 8000);
 FONTS = ("https://fonts.googleapis.com/css2?family=Reem+Kufi:wght@400;600"
          "&family=Tajawal:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap")
 
+# رقم إصدار يتغيّر لوحده مع كل تشغيل جديد للسيرفر (كل ديبلوي = عملية جديدة).
+# بيتحط في نهاية روابط app.css و app.js عشان نجبر المتصفح يجيب النسخة
+# الجديدة على طول بدل ما يفضل يستخدم نسخة متكاشة قديمة لمدة ساعة.
+ASSET_VERSION = str(int(time.time()))
+
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -2097,7 +2159,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 <title>{{ app_name }} — تسجيل الدخول</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="{{ fonts }}" rel="stylesheet">
-<link rel="stylesheet" href="/assets/app.css">
+<link rel="stylesheet" href="/assets/app.css?v={{ asset_v }}">
 </head>
 <body>
 <div class="login-page">
@@ -2129,7 +2191,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <title>{{ app_name }}</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="{{ fonts }}" rel="stylesheet">
-<link rel="stylesheet" href="/assets/app.css">
+<link rel="stylesheet" href="/assets/app.css?v={{ asset_v }}">
 </head>
 <body>
 <div class="wrap">
@@ -2307,7 +2369,7 @@ INDEX_HTML = """<!DOCTYPE html>
   window.PERKS = {{ perks | tojson }};
   window.CURRENCIES = {{ currencies | tojson }};
 </script>
-<script src="/assets/app.js"></script>
+<script src="/assets/app.js?v={{ asset_v }}"></script>
 </body>
 </html>"""
 
@@ -2363,27 +2425,29 @@ def login_required(fn):
 
 
 # ── الملفات الثابتة ──────────────────────────────────────
+# الروابط دلوقتي فيها ?v=ASSET_VERSION بيتغيّر مع كل نشر جديد، فمفيش خطورة
+# من كاش طويل — أي تحديث للكود هيغيّر الرابط نفسه فيجيب نسخة جديدة أوتوماتيك
 @app.route("/assets/app.css")
 def asset_css():
     return Response(CSS, mimetype="text/css",
-                    headers={"Cache-Control": "public, max-age=3600"})
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 @app.route("/assets/app.js")
 def asset_js():
     return Response(JS, mimetype="application/javascript",
-                    headers={"Cache-Control": "public, max-age=3600"})
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 # ── الدخول ───────────────────────────────────────────────
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
-        return render_template_string(LOGIN_HTML, app_name=APP_NAME, fonts=FONTS)
+        return render_template_string(LOGIN_HTML, app_name=APP_NAME, fonts=FONTS, asset_v=ASSET_VERSION)
 
     if not OWNER_PASS:
         return render_template_string(
-            LOGIN_HTML, app_name=APP_NAME, fonts=FONTS,
+            LOGIN_HTML, app_name=APP_NAME, fonts=FONTS, asset_v=ASSET_VERSION,
             error="مفيش كلمة سر متسجّلة على السيرفر. ضيف OWNER_PASS في إعدادات Render."), 500
 
     username = (request.form.get("username") or "").strip()
@@ -2392,7 +2456,7 @@ def login():
     if not (same_secret(username, OWNER_USER) and same_secret(password, OWNER_PASS)):
         time.sleep(1)
         return render_template_string(
-            LOGIN_HTML, app_name=APP_NAME, fonts=FONTS,
+            LOGIN_HTML, app_name=APP_NAME, fonts=FONTS, asset_v=ASSET_VERSION,
             error="اسم المستخدم أو كلمة السر غلط."), 401
 
     session.permanent = True
@@ -2409,8 +2473,11 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
-    return render_template_string(INDEX_HTML, app_name=APP_NAME, fonts=FONTS,
-                                  perks=PERKS, currencies=CURRENCIES)
+    resp = make_response(render_template_string(
+        INDEX_HTML, app_name=APP_NAME, fonts=FONTS, asset_v=ASSET_VERSION,
+        perks=PERKS, currencies=CURRENCIES))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/healthz")
@@ -2448,6 +2515,7 @@ def _public_account(row):
         "id": row["id"], "label": row["label"], "squad": row["squad"],
         "enabled": row["enabled"], "has_token": bool(row["token"]),
         "perk": row["perk"], "currency": row["currency"],
+        "perk_progress": row["perk_progress"], "perk_target": row["perk_target"],
         "auto_quests": row["auto_quests"],
         "auto_wheel": row["auto_wheel"], "auto_work": row["auto_work"],
         "auto_pills": row["auto_pills"], "pills_limit": row["pills_limit"],
@@ -2575,6 +2643,24 @@ def api_update_account(account_id):
             return jsonify({"ok": False, "error": "حد الماس لازم يكون رقم صحيح موجب"}), 400
         sets.append("pills_limit=%s")
         params.append(limit)
+
+    if "perk_target" in data:
+        raw = data.get("perk_target")
+        if raw in (None, "", 0):
+            sets.append("perk_target=NULL")
+        else:
+            try:
+                target = int(raw)
+                if target <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "الهدف لازم يكون رقم صحيح أكبر من صفر"}), 400
+            sets.append("perk_target=%s")
+            params.append(target)
+
+    # لما المهارة تتغيّر يدوي، نبدأ العدّاد من الأول عشان الهدف يبقى له معنى
+    if "perk" in data and data.get("perk") != account["perk"]:
+        sets.append("perk_progress=0")
 
     if not sets:
         return jsonify({"ok": False, "error": "مفيش حاجة تتغيّر"}), 400
