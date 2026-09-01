@@ -93,7 +93,6 @@ PERKS = {
     "supply_drill":   {"key": "ikmal_talim",      "label": "الإمداد والتدريب"},
 }
 PERK_KEYS = {k: v["key"] for k, v in PERKS.items()}
-PERK_CYCLE = list(PERKS.keys())  # نفس ترتيب المربعات في الكارت — بيتلف عليه لما نوصل الهدف
 
 CURRENCIES = {"money": "المال", "diamond": "الماس"}
 
@@ -212,6 +211,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     auto_pills    BOOLEAN NOT NULL DEFAULT FALSE,
     pills_limit   BIGINT NOT NULL DEFAULT 2500,
     perk_progress INTEGER NOT NULL DEFAULT 0,
+    perk_next_at  TIMESTAMPTZ,
     perk_target   INTEGER,
     auto_military BOOLEAN NOT NULL DEFAULT FALSE,
     military_joined_until TIMESTAMPTZ,
@@ -283,6 +283,7 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS upgrade_plan JSONB",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS feature_fail_counts JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_progress INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_next_at TIMESTAMPTZ",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_target INTEGER",
 ]
 
@@ -804,10 +805,13 @@ def task_auto_perk(account, payload):
     الحساب "شغّال" — كل نجاح بيستنى الوقت الحقيقي اللي اللعبة بتحدده (من
     بروفايل محدّث) قبل ما يحاول تاني، وهكذا للأبد لحد ما توقف الحساب أو
     تبدأ خطة تطوير (اللي بتاخد الأولوية وتوقف السلسلة دي مؤقتاً).
+    بنسجّل perk_next_at بالظبط عشان الواجهة تعرض عدّاد تنازلي حي زي اللعبة.
     """
     if not account.get("enabled"):
+        db_execute("UPDATE accounts SET perk_next_at=NULL WHERE id=%s", (account["id"],))
         return None  # الحساب موقوف — منجدولش تاني، السلسلة بتقف هنا بهدوء
     if account.get("upgrade_plan"):
+        db_execute("UPDATE accounts SET perk_next_at=NULL WHERE id=%s", (account["id"],))
         return None  # فيه خطة شغّالة بالفعل — منتعارضش معاها
 
     perk = account.get("perk")
@@ -820,30 +824,27 @@ def task_auto_perk(account, payload):
     try:
         client.upgrade_skill(skill_key, currency)
     except AlreadyUpgrading as e:
+        db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
+                  (now() + timedelta(seconds=e.remaining_seconds), account["id"]))
         queue_task(account["id"], "auto_perk", delay_seconds=e.remaining_seconds)
         return None
     except RateLimited as e:
+        db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
+                  (now() + timedelta(seconds=e.retry_after), account["id"]))
         queue_task(account["id"], "auto_perk", delay_seconds=e.retry_after)
         return None
 
     progress = (account.get("perk_progress") or 0) + 1
-    target = account.get("perk_target")
     label = PERKS[perk]["label"]
-
-    if target and progress >= target:
-        next_perk = PERK_CYCLE[(PERK_CYCLE.index(perk) + 1) % len(PERK_CYCLE)]
-        db_execute("UPDATE accounts SET perk=%s, perk_progress=0 WHERE id=%s",
-                  (next_perk, account["id"]))
-        message = f"{label} خلصت ({progress}/{target}) — بدأنا {PERKS[next_perk]['label']}"
-    else:
-        db_execute("UPDATE accounts SET perk_progress=%s WHERE id=%s",
-                  (progress, account["id"]))
-        message = f"تطوير {label} ({progress}{f'/{target}' if target else ''})"
+    message = f"تطوير {label} ({progress})"
 
     try:
         wait_s = skill_cooldown_seconds(client.profile()) or 65
     except Exception:
         wait_s = 65
+    next_at = now() + timedelta(seconds=wait_s)
+    db_execute("UPDATE accounts SET perk_progress=%s, perk_next_at=%s WHERE id=%s",
+              (progress, next_at, account["id"]))
     queue_task(account["id"], "auto_perk", delay_seconds=wait_s)
     return message
 
@@ -1343,6 +1344,12 @@ select.field{cursor:pointer}
   border-right:2px solid var(--green-bright);padding:6px 9px;border-radius:0 var(--r-sm) var(--r-sm) 0;
   display:flex;align-items:center;gap:8px}
 .plan-badge .txt{flex:1}
+.countdown-badge{margin-bottom:10px;font-size:12px;color:var(--sand);
+  background:rgba(217,164,65,.08);border:1px solid rgba(217,164,65,.25);
+  border-radius:var(--r-sm);padding:7px 10px;display:flex;align-items:center;
+  gap:6px;flex-wrap:wrap}
+.countdown-badge .cd-label{color:var(--text-soft);font-size:11px}
+.countdown-badge .cd-text{font-family:var(--font-mono);font-weight:600;direction:ltr}
 
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft);
   border-radius:var(--r-sm);overflow:hidden;margin:12px 0 10px}
@@ -1520,12 +1527,7 @@ function notifyPerkChanges(oldAccounts, newAccounts) {
 
     if (before.perk === a.perk && a.perk_progress > before.perk_progress) {
       const label = window.PERKS[a.perk]?.label || a.perk;
-      const target = a.perk_target ? `/${a.perk_target}` : '';
-      toast(`✅ ${a.label || a.game_name || 'حساب'}: اتطوّرت ${label} (${a.perk_progress}${target})`);
-    } else if (before.perk !== a.perk && before.perk_target) {
-      const oldLabel = window.PERKS[before.perk]?.label || before.perk;
-      const newLabel = window.PERKS[a.perk]?.label || a.perk;
-      toast(`🎯 ${a.label || a.game_name || 'حساب'}: خلصت ${oldLabel} وبدأت ${newLabel}`);
+      toast(`✅ ${a.label || a.game_name || 'حساب'}: اتطوّرت ${label} (${a.perk_progress})`);
     }
   }
 }
@@ -1576,7 +1578,7 @@ function cardHtml(a) {
   const skill = (key, label) => {
     const isActive = a.perk === key;
     const counter = isActive
-      ? `<span class="skill-count">${a.perk_progress}${a.perk_target ? '/' + a.perk_target : ''}</span>`
+      ? `<span class="skill-count">${a.perk_progress}</span>`
       : '';
     return `
     <div class="skill ${isActive ? 'active' : ''}" role="button" tabindex="0"
@@ -1653,15 +1655,11 @@ function cardHtml(a) {
       ${skill('scientist', 'علم')}
       ${skill('supply_drill', 'إمداد')}
     </div>
-    <div class="hint" style="margin:-4px 0 4px">دوس على مهارة تختارها — لو الحساب "شغّال" هتتطور باستمرار لوحدها</div>
-    <div class="proxy-line" style="flex-wrap:wrap;row-gap:6px;margin-bottom:8px">
-      <span class="dot" style="background:var(--green-bright)"></span>
-      <span style="font-size:11px;color:var(--muted);white-space:nowrap">هدف المهارة الحالية</span>
-      <input class="field" type="number" min="1" value="${a.perk_target || ''}" placeholder="بلا نهاية"
-             style="width:70px;padding:5px 7px;font-size:11.5px;margin-inline-start:auto"
-             onchange="patchAccount(${a.id}, {perk_target: this.value ? parseInt(this.value) : null})">
-      <div class="hint" style="width:100%;margin:0">لما توصل للهدف، بينتقل تلقائي للمهارة اللي بعدها في الترتيب</div>
-    </div>
+    <div class="hint" style="margin:-4px 0 8px">دوس على مهارة تختارها — لو الحساب "شغّال" هتتطور باستمرار لوحدها</div>
+    ${a.perk_next_at ? `
+    <div class="countdown-badge" data-until="${a.perk_next_at}">
+      ⏳ <span class="cd-label">الترقية الجاية خلال</span> <span class="cd-text">…</span>
+    </div>` : ''}
 
     <div class="selects">
       <select class="field" style="width:100%" onchange="patchAccount(${a.id}, {currency: this.value})">
@@ -2133,9 +2131,31 @@ function bind() {
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModals(); });
 }
 
+// عدّاد تنازلي حي زي بتاع اللعبة نفسها — بيتحدّث كل ثانية على جهازك بس،
+// من غير أي طلب سيرفر إضافي (بيستخدم الوقت اللي وصل أصلاً مع آخر تحديث)
+function formatCountdown(ms) {
+  if (ms <= 0) return 'دلوقتي تقريباً';
+  const totalSeconds = Math.floor(ms / 1000);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  if (h > 0) return `${h}س ${m}د ${s}ث`;
+  if (m > 0) return `${m}د ${s}ث`;
+  return `${s}ث`;
+}
+
+function tickCountdowns() {
+  document.querySelectorAll('.countdown-badge[data-until]').forEach((el) => {
+    const target = new Date(el.dataset.until).getTime();
+    const textEl = el.querySelector('.cd-text');
+    if (textEl) textEl.textContent = formatCountdown(target - Date.now());
+  });
+}
+
 bind();
 loadState();
 setInterval(loadState, 8000);
+setInterval(tickCountdowns, 1000);
 """
 
 
@@ -2515,7 +2535,8 @@ def _public_account(row):
         "id": row["id"], "label": row["label"], "squad": row["squad"],
         "enabled": row["enabled"], "has_token": bool(row["token"]),
         "perk": row["perk"], "currency": row["currency"],
-        "perk_progress": row["perk_progress"], "perk_target": row["perk_target"],
+        "perk_progress": row["perk_progress"],
+        "perk_next_at": row["perk_next_at"].isoformat() if row["perk_next_at"] else None,
         "auto_quests": row["auto_quests"],
         "auto_wheel": row["auto_wheel"], "auto_work": row["auto_work"],
         "auto_pills": row["auto_pills"], "pills_limit": row["pills_limit"],
@@ -2619,6 +2640,10 @@ def api_update_account(account_id):
             sets.append(f"{field}=%s")
             params.append(bool(data.get(field)))
 
+    # لو الحساب بيتوقف، امسح عدّاد التطوير على طول — مش هيحصل حاجة فعلياً
+    if "enabled" in data and not data.get("enabled"):
+        sets.append("perk_next_at=NULL")
+
     # البروكسي بيتبعت كسطر واحد "عنوان:منفذ:يوزر:باسورد" ونفكّه هنا
     if "proxy_line" in data:
         raw = (data.get("proxy_line") or "").strip()
@@ -2644,21 +2669,7 @@ def api_update_account(account_id):
         sets.append("pills_limit=%s")
         params.append(limit)
 
-    if "perk_target" in data:
-        raw = data.get("perk_target")
-        if raw in (None, "", 0):
-            sets.append("perk_target=NULL")
-        else:
-            try:
-                target = int(raw)
-                if target <= 0:
-                    raise ValueError
-            except (TypeError, ValueError):
-                return jsonify({"ok": False, "error": "الهدف لازم يكون رقم صحيح أكبر من صفر"}), 400
-            sets.append("perk_target=%s")
-            params.append(target)
-
-    # لما المهارة تتغيّر يدوي، نبدأ العدّاد من الأول عشان الهدف يبقى له معنى
+    # لما المهارة تتغيّر يدوي، نبدأ العدّاد من الأول
     if "perk" in data and data.get("perk") != account["perk"]:
         sets.append("perk_progress=0")
 
@@ -2844,7 +2855,7 @@ def _handle_upgrade_plan(data):
     delay = 0
     for account_id in targets:
         plan = {"steps": steps, "step_index": 0, "done_in_step": 0}
-        db_execute("UPDATE accounts SET upgrade_plan=%s::jsonb WHERE id=%s",
+        db_execute("UPDATE accounts SET upgrade_plan=%s::jsonb, perk_next_at=NULL WHERE id=%s",
                   (json.dumps(plan), account_id))
         queue_task(account_id, "plan_step", delay_seconds=delay)
         if spread:
