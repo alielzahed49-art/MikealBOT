@@ -577,7 +577,8 @@ class GameClient:
         raise GameError(_message_of(body) or f"التطوير التلقائي اترفض ({status})")
 
     def toggle_work(self):
-        status, body = self.post("/players/work/toggle", {})
+        """POST /auto/toggle {mode:'work'} — المسار الحقيقي اتأكّد من الشبكة."""
+        status, body = self.post("/auto/toggle", {"mode": "work"})
         if status in (200, 201):
             return body
         raise GameError(_message_of(body) or f"العمل اترفض ({status})")
@@ -593,7 +594,8 @@ class GameClient:
         raise GameError(_message_of(body) or "المكافأة مش متاحة")
 
     def wheel_state(self):
-        return self.get("/wheel/state")
+        """GET /wheel (مش /wheel/state) — المسار الحقيقي اتأكّد من الشبكة."""
+        return self.get("/wheel")
 
     def spin_wheel(self):
         status, body = self.post("/wheel/spin", {"confirm_paid": False})
@@ -745,10 +747,15 @@ def _parse_time(value):
 
 
 # ── منفّذو المهام ────────────────────────────────────────
-def task_refresh(account, payload):
-    data = parse_profile(client_for(account).profile())
+def _apply_profile_snapshot(account_id, account, profile):
+    """
+    بيحدّث كل بيانات الحساب المعروضة (المستوى، الأرصدة، مستويات المهارات...)
+    من بروفايل جاي من اللعبة. نفس المنطق اللي كان مقصور على "تحديث البيانات"
+    اليدوي، دلوقتي بنستخدمه كمان بعد كل ترقية تلقائية عشان الأرقام تتحدّث
+    على طول من غير ما تنتظر تحديث يدوي.
+    """
+    data = parse_profile(profile)
 
-    # لو الموقع الجديد بقى هو نفسه الوجهة اللي كان مسافر ليها، يبقى وصل
     clear_travel = (
         account.get("travel_destination")
         and data["location"]
@@ -766,7 +773,12 @@ def task_refresh(account, payload):
         (data["game_name"], data["avatar_url"], data["level_num"], data["xp_pct"],
          data["balance"], data["diamonds"], data["location"], data["nation"],
          data["lv_barracks"], data["lv_war"], data["lv_scientist"], data["lv_supply"],
-         account["id"]))
+         account_id))
+    return data
+
+
+def task_refresh(account, payload):
+    data = _apply_profile_snapshot(account["id"], account, client_for(account).profile())
     return f"البيانات اتحدّثت — المستوى {data['level_num']}"
 
 
@@ -838,10 +850,20 @@ def task_auto_perk(account, payload):
     label = PERKS[perk]["label"]
     message = f"تطوير {label} ({progress})"
 
+    # نجيب بروفايل جديد — مرة واحدة بس — عشان (أ) نعرف الوقت الحقيقي للترقية
+    # الجاية و(ب) نحدّث كل الأرقام المعروضة (المستوى، مستويات المهارات...)
+    # على طول، بدل ما تفضل واقفة لحد "تحديث البيانات" اليدوي
     try:
-        wait_s = skill_cooldown_seconds(client.profile()) or 65
+        fresh_profile = client.profile()
     except Exception:
+        fresh_profile = None
+
+    if fresh_profile:
+        _apply_profile_snapshot(account["id"], account, fresh_profile)
+        wait_s = skill_cooldown_seconds(fresh_profile) or 65
+    else:
         wait_s = 65
+
     next_at = now() + timedelta(seconds=wait_s)
     db_execute("UPDATE accounts SET perk_progress=%s, perk_next_at=%s WHERE id=%s",
               (progress, next_at, account["id"]))
@@ -868,7 +890,7 @@ def task_quests(account, payload):
 def task_wheel(account, payload):
     client = client_for(account)
     state = client.wheel_state()
-    if not (state.get("free_available") or state.get("can_spin_free")):
+    if not state.get("enabled") or (state.get("free_left") or 0) <= 0:
         return None
     client.spin_wheel()
     return "لفّ العجلة المجانية"
@@ -1349,7 +1371,8 @@ select.field{cursor:pointer}
   border-radius:var(--r-sm);padding:7px 10px;display:flex;align-items:center;
   gap:6px;flex-wrap:wrap}
 .countdown-badge .cd-label{color:var(--text-soft);font-size:11px}
-.countdown-badge .cd-text{font-family:var(--font-mono);font-weight:600;direction:ltr}
+.countdown-badge .cd-text{font-family:var(--font-mono);font-weight:600;
+  direction:ltr;unicode-bidi:isolate;display:inline-block}
 
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft);
   border-radius:var(--r-sm);overflow:hidden;margin:12px 0 10px}
@@ -1546,6 +1569,41 @@ function renderSquadOptions() {
   $('squad-options').innerHTML = state.squads.map((s) => `<option value="${esc(s)}">`).join('');
 }
 
+function openSquadsModal() {
+  renderSquadsList();
+  openModal('modal-squads');
+}
+
+function renderSquadsList() {
+  const counts = {};
+  state.accounts.forEach((a) => { counts[a.squad] = (counts[a.squad] || 0) + 1; });
+  const squads = Object.keys(counts).sort();
+
+  if (!squads.length) {
+    $('squads-list').innerHTML = '<div class="province" style="color:var(--muted)">مفيش مجموعات لسه</div>';
+    return;
+  }
+
+  $('squads-list').innerHTML = squads.map((s) => `
+    <div class="province" style="display:flex;align-items:center;gap:8px">
+      <span style="flex:1">${esc(s)} <span style="color:var(--muted);font-size:11px">(${counts[s]} حساب)</span></span>
+      ${s === 'المجموعة الأولى'
+        ? '<span style="font-size:11px;color:var(--muted)">افتراضية</span>'
+        : `<button class="btn btn-sm btn-danger" onclick="deleteSquad('${esc(s).replace(/'/g, "\\'")}')">حذف</button>`}
+    </div>`).join('');
+}
+
+async function deleteSquad(name) {
+  if (!confirm(`تمسح مجموعة "${name}"؟ الحسابات اللي فيها هترجع لـ"المجموعة الأولى".`)) return;
+  try {
+    const r = await api('/api/squads/delete', { method: 'POST', body: JSON.stringify({ squad: name }) });
+    toast(`اتمسحت — ${r.moved} حساب رجعوا للمجموعة الأولى`);
+    if (state.squadFilter === name) state.squadFilter = '';
+    await loadState();
+    renderSquadsList();
+  } catch (e) { toast(e.message, true); }
+}
+
 function visibleAccounts() {
   if (!state.squadFilter) return state.accounts;
   return state.accounts.filter((a) => a.squad === state.squadFilter);
@@ -1648,7 +1706,7 @@ function cardHtml(a) {
     <div class="hint" style="margin:-4px 0 8px">دوس على مهارة تختارها — لو الحساب "شغّال" هتتطور باستمرار لوحدها</div>
     ${a.perk_next_at ? `
     <div class="countdown-badge" data-until="${a.perk_next_at}">
-      ⏳ <span class="cd-label">الترقية الجاية خلال</span> <span class="cd-text">…</span>
+      ⏳ <span class="cd-label">الترقية الجاية خلال</span> <span class="cd-text" dir="ltr">…</span>
     </div>` : ''}
 
     <div class="selects">
@@ -2100,6 +2158,7 @@ function bind() {
     state.selected.clear();
     renderAccounts(); renderPickState();
   };
+  $('btn-manage-squads').onclick = openSquadsModal;
   $('squad-filter').onchange = (e) => {
     state.squadFilter = e.target.value;
     renderAccounts();
@@ -2224,6 +2283,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <select class="field" id="squad-filter" style="max-width:170px">
         <option value="">كل المجموعات</option>
       </select>
+      <button class="btn btn-sm btn-ghost" id="btn-manage-squads" title="إدارة المجموعات">⚙️ المجموعات</button>
       <button class="btn btn-sm" id="btn-select-all">اختيار الكل</button>
       <button class="btn btn-sm" id="btn-select-none">إلغاء الاختيار</button>
       <span class="command-count" id="pick-count">مفيش اختيار</span>
@@ -2249,6 +2309,23 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
   <div class="log" id="log"></div>
 
+</div>
+
+<div class="overlay" id="modal-squads">
+  <div class="modal">
+    <div class="modal-head"><h3>المجموعات</h3></div>
+    <div class="modal-body">
+      <div class="province-list" id="squads-list" style="max-height:320px"></div>
+      <div class="hint" style="margin-top:8px">
+        مسح مجموعة بيرجّع الحسابات اللي فيها لـ"المجموعة الأولى" — مش بيمسح
+        الحسابات نفسها. عشان تعمل مجموعة جديدة، اكتب اسمها وقت ما تضيف أو
+        تعدّل حساب.
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" data-close>إغلاق</button>
+    </div>
+  </div>
 </div>
 
 <div class="overlay" id="modal-account">
@@ -2683,6 +2760,29 @@ def api_delete_account(account_id):
     db_execute("DELETE FROM accounts WHERE id=%s", (account_id,))
     add_log(f"اتمسح حساب: {account_title(account)}", "warn")
     return jsonify({"ok": True})
+
+
+DEFAULT_SQUAD = "المجموعة الأولى"
+
+
+@app.route("/api/squads/delete", methods=["POST"])
+@login_required
+def api_delete_squad():
+    """
+    بيمسح مجموعة — مش بمعنى حذف صف من جدول (المجموعات أصلاً مش جدول منفصل،
+    هي بس اسم متسجّل على كل حساب)، لكن بيرجّع كل الحسابات اللي فيها للمجموعة
+    الافتراضية، فالاسم القديم بيختفي من القايمة تلقائي لأن محدش بيحمله.
+    """
+    data = request.get_json(silent=True) or {}
+    squad = (data.get("squad") or "").strip()
+    if not squad:
+        return jsonify({"ok": False, "error": "مفيش مجموعة محددة"}), 400
+    if squad == DEFAULT_SQUAD:
+        return jsonify({"ok": False, "error": "دي المجموعة الافتراضية — منقدرش نمسحها"}), 400
+
+    n = db_execute("UPDATE accounts SET squad=%s WHERE squad=%s", (DEFAULT_SQUAD, squad))
+    add_log(f"اتمسحت مجموعة \"{squad}\" — {n} حساب رجعوا لـ\"{DEFAULT_SQUAD}\"", "warn")
+    return jsonify({"ok": True, "moved": n})
 
 
 @app.route("/api/accounts/<int:account_id>/plan/cancel", methods=["POST"])
