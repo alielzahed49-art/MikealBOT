@@ -636,7 +636,11 @@ def parse_profile(profile):
         current = skills.get(key, "?")
         pending = skills.get(f"{key}_pending")
         if pending and pending != current:
-            return f"{current}←{pending}"
+            try:
+                lo, hi = sorted((int(current), int(pending)))
+                return f"{lo}→{hi}"
+            except (TypeError, ValueError):
+                return f"{current}→{pending}"
         return str(current)
 
     balance = profile.get("balance", 0)
@@ -1227,8 +1231,8 @@ button,input,select,textarea{font-family:inherit;font-size:inherit;color:inherit
 .btn-danger{color:var(--red-bright);border-color:rgba(229,72,77,.3);background:var(--red-dim)}
 .btn-sm{padding:6px 10px;font-size:12px}
 
-.command-bar{position:sticky;top:0;z-index:40;background:rgba(14,17,22,.92);
-  backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:var(--r-md);
+.command-bar{position:sticky;top:0;z-index:40;background:var(--bg);
+  border:1px solid var(--line);border-radius:var(--r-md);
   padding:12px;margin-bottom:18px;box-shadow:var(--shadow)}
 .command-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .command-count{font-family:var(--font-mono);font-size:12px;color:var(--sand);padding:4px 9px;
@@ -1290,11 +1294,15 @@ select.field{cursor:pointer}
 
 .skills{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
 .skill{flex:1;min-width:62px;text-align:center;background:var(--bg-raise);
-  border:1px solid var(--line-soft);border-radius:var(--r-sm);padding:5px 3px}
+  border:1px solid var(--line-soft);border-radius:var(--r-sm);padding:5px 3px;
+  cursor:pointer;transition:border-color .15s,background .15s;user-select:none}
+.skill:hover{background:var(--panel-2)}
+.skill:focus-visible{outline:2px solid var(--red-bright);outline-offset:1px}
 .skill .k{font-size:9.5px;color:var(--muted);display:block}
 .skill .v{font-family:var(--font-mono);font-size:12.5px}
-.skill.active{border-color:rgba(217,164,65,.4)}
+.skill.active{border-color:var(--sand);border-width:1.5px;background:rgba(217,164,65,.08)}
 .skill.active .v{color:var(--sand)}
+.skill.active .k{color:var(--sand)}
 
 .toggles{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}
 .toggle{display:flex;align-items:center;gap:7px;padding:7px 9px;background:var(--bg-raise);
@@ -1481,7 +1489,8 @@ function cardHtml(a) {
   if (a.status === 'error') classes.push('is-error');
 
   const skill = (key, label) => `
-    <div class="skill ${a.perk === key ? 'active' : ''}">
+    <div class="skill ${a.perk === key ? 'active' : ''}" role="button" tabindex="0"
+         onclick="patchAccount(${a.id}, {perk: '${key}'})">
       <span class="k">${label}</span>
       <span class="v">${esc(a.skills[key])}</span>
     </div>`;
@@ -1552,13 +1561,10 @@ function cardHtml(a) {
       ${skill('scientist', 'علم')}
       ${skill('supply_drill', 'إمداد')}
     </div>
+    <div class="hint" style="margin:-4px 0 8px">دوس على مهارة عشان تختارها للترقية</div>
 
     <div class="selects">
-      <select class="field" onchange="patchAccount(${a.id}, {perk: this.value})">
-        ${Object.entries(window.PERKS).map(([k, v]) =>
-          `<option value="${k}" ${a.perk === k ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}
-      </select>
-      <select class="field" onchange="patchAccount(${a.id}, {currency: this.value})">
+      <select class="field" style="width:100%" onchange="patchAccount(${a.id}, {currency: this.value})">
         ${Object.entries(window.CURRENCIES).map(([k, v]) =>
           `<option value="${k}" ${a.currency === k ? 'selected' : ''}>${esc(v)}</option>`).join('')}
       </select>
@@ -1571,17 +1577,19 @@ function cardHtml(a) {
       ${toggle('auto_military', 'عملية عسكرية')}
     </div>
 
-    <div class="proxy-line ${a.auto_pills ? 'set' : ''}" style="gap:6px">
+    <div class="proxy-line ${a.auto_pills ? 'set' : ''}" style="flex-wrap:wrap;row-gap:8px">
       <span class="dot"></span>
       <label class="toggle ${a.auto_pills ? 'on' : ''}" style="padding:0;border:none;background:none;flex-shrink:0">
         <input type="checkbox" ${a.auto_pills ? 'checked' : ''}
                onchange="patchAccount(${a.id}, {auto_pills: this.checked})">
         <span>حبوب تلقائي</span>
       </label>
-      <span style="font-size:11px;color:var(--muted)">فوق</span>
-      <input class="field" type="number" min="0" value="${a.pills_limit}" style="width:80px;padding:5px 7px;font-size:11.5px"
-             onchange="patchAccount(${a.id}, {pills_limit: parseInt(this.value)||0})">
-      <span style="font-size:11px;color:var(--muted)">ماسة</span>
+      <div style="display:flex;align-items:center;gap:6px;margin-inline-start:auto;flex-shrink:0">
+        <span style="font-size:11px;color:var(--muted);white-space:nowrap">فوق</span>
+        <input class="field" type="number" min="0" value="${a.pills_limit}" style="width:70px;padding:5px 7px;font-size:11.5px"
+               onchange="patchAccount(${a.id}, {pills_limit: parseInt(this.value)||0})">
+        <span style="font-size:11px;color:var(--muted);white-space:nowrap">ماسة</span>
+      </div>
     </div>
 
     <div class="proxy-line ${a.proxy.configured ? 'set' : ''}">
