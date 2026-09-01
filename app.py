@@ -793,6 +793,42 @@ def task_residence(account, payload):
     return f"طلب إقامة لـ {country_name}" if country_name else "طلب الإقامة اترسل"
 
 
+def task_auto_perk(account, payload):
+    """
+    تطوير مستمر للمهارة المختارة على الحساب (a.perk / a.currency) طول ما
+    الحساب "شغّال" — كل نجاح بيستنى الوقت الحقيقي اللي اللعبة بتحدده (من
+    بروفايل محدّث) قبل ما يحاول تاني، وهكذا للأبد لحد ما توقف الحساب أو
+    تبدأ خطة تطوير (اللي بتاخد الأولوية وتوقف السلسلة دي مؤقتاً).
+    """
+    if not account.get("enabled"):
+        return None  # الحساب موقوف — منجدولش تاني، السلسلة بتقف هنا بهدوء
+    if account.get("upgrade_plan"):
+        return None  # فيه خطة شغّالة بالفعل — منتعارضش معاها
+
+    perk = account.get("perk")
+    currency = account.get("currency")
+    skill_key = PERK_KEYS.get(perk)
+    if not skill_key:
+        return None
+
+    client = client_for(account)
+    try:
+        client.upgrade_skill(skill_key, currency)
+    except AlreadyUpgrading as e:
+        queue_task(account["id"], "auto_perk", delay_seconds=e.remaining_seconds)
+        return None
+    except RateLimited as e:
+        queue_task(account["id"], "auto_perk", delay_seconds=e.retry_after)
+        return None
+
+    try:
+        wait_s = skill_cooldown_seconds(client.profile()) or 65
+    except Exception:
+        wait_s = 65
+    queue_task(account["id"], "auto_perk", delay_seconds=wait_s)
+    return f"تطوير {PERKS[perk]['label']} — هيتجدد لوحده"
+
+
 def task_quests(account, payload):
     client = client_for(account)
     claimed = 0
@@ -952,6 +988,7 @@ HANDLERS = {
     "visa": task_visa,
     "residence": task_residence,
     "quests": task_quests,
+    "auto_perk": task_auto_perk,
     "wheel": task_wheel,
     "work": task_work,
     "pills_auto": task_pills_auto,
@@ -962,6 +999,7 @@ HANDLERS = {
 KIND_LABELS = {
     "refresh": "تحديث", "travel": "سفر", "visa": "طلب فيزا", "residence": "طلب إقامة",
     "quests": "مهام يومية",
+    "auto_perk": "تطوير مستمر",
     "wheel": "عجلة", "work": "شغل", "pills_auto": "تحويل حبوب تلقائي",
     "military_auto": "انضمام عسكري", "plan_step": "خطوة من خطة تطوير",
 }
@@ -1090,6 +1128,11 @@ def schedule_periodic():
 
         last_seen = account.get("last_seen")
         if (last_seen is None or last_seen < stale_before) and _queue_if_free(aid, "refresh"):
+            added += 1
+
+        # الحساب "شغّال" = يطوّر المهارة المختارة باستمرار، إلا لو فيه خطة
+        # تطوير شغّالة بالفعل (هي بتاخد الأولوية)
+        if not account.get("upgrade_plan") and _queue_if_free(aid, "auto_perk"):
             added += 1
 
         if account.get("auto_quests") and _queue_if_free(aid, "quests", 60):
@@ -1561,7 +1604,7 @@ function cardHtml(a) {
       ${skill('scientist', 'علم')}
       ${skill('supply_drill', 'إمداد')}
     </div>
-    <div class="hint" style="margin:-4px 0 8px">دوس على مهارة عشان تختارها للترقية</div>
+    <div class="hint" style="margin:-4px 0 8px">دوس على مهارة تختارها — لو الحساب "شغّال" هتتطور باستمرار لوحدها</div>
 
     <div class="selects">
       <select class="field" style="width:100%" onchange="patchAccount(${a.id}, {currency: this.value})">
