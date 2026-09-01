@@ -1372,9 +1372,6 @@ select.field{cursor:pointer}
 .skill.active{border-color:var(--sand);border-width:1.5px;background:rgba(217,164,65,.08)}
 .skill.active .v{color:var(--sand)}
 .skill.active .k{color:var(--sand)}
-.skill-count{display:block;font-family:var(--font-mono);font-size:9px;
-  color:var(--green-bright);margin-top:1px;direction:ltr}
-
 .toggles{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}
 .toggle{display:flex;align-items:center;gap:7px;padding:7px 9px;background:var(--bg-raise);
   border:1px solid var(--line-soft);border-radius:var(--r-sm);cursor:pointer;font-size:12px;
@@ -1575,19 +1572,12 @@ function cardHtml(a) {
   if (a.enabled && a.status !== 'error') classes.push('is-running');
   if (a.status === 'error') classes.push('is-error');
 
-  const skill = (key, label) => {
-    const isActive = a.perk === key;
-    const counter = isActive
-      ? `<span class="skill-count">${a.perk_progress}</span>`
-      : '';
-    return `
-    <div class="skill ${isActive ? 'active' : ''}" role="button" tabindex="0"
+  const skill = (key, label) => `
+    <div class="skill ${a.perk === key ? 'active' : ''}" role="button" tabindex="0"
          onclick="patchAccount(${a.id}, {perk: '${key}'})">
       <span class="k">${label}</span>
       <span class="v">${esc(a.skills[key])}</span>
-      ${counter}
     </div>`;
-  };
 
   const toggle = (field, label) => `
     <label class="toggle ${a[field] ? 'on' : ''}">
@@ -1774,7 +1764,6 @@ function openAccountModal(id = null) {
   const account = id ? state.accounts.find((a) => a.id === id) : null;
   $('account-modal-title').textContent = account ? 'تعديل الحساب' : 'حساب جديد';
   $('acc-id').value = account ? account.id : '';
-  $('acc-label').value = account ? account.label : '';
   $('acc-squad').value = account ? account.squad : 'المجموعة الأولى';
   $('acc-token').value = '';
   $('acc-token').placeholder = account ? 'سيبه فاضي لو مش عايز تغيّره' : 'الصق التوكن هنا';
@@ -1786,7 +1775,6 @@ async function saveAccount() {
   const id = $('acc-id').value;
   const token = $('acc-token').value.trim();
   const payload = {
-    label: $('acc-label').value.trim(),
     squad: $('acc-squad').value.trim() || 'المجموعة الأولى',
   };
   if (token) payload.token = token;
@@ -2273,18 +2261,17 @@ INDEX_HTML = """<!DOCTYPE html>
         <input class="field" id="acc-token" dir="ltr" placeholder="الصق التوكن هنا">
         <div class="hint" id="acc-token-hint">
           بيتخزّن في قاعدة البيانات ومبيظهرش تاني. جيب بياناته من اللعبة على طول
-          بعد الحفظ — مش محتاج تكتب اسم أو تعمل تحديث يدوي.
+          بعد الحفظ (الاسم بيتاخد من اللعبة نفسها — مش محتاج تكتبه).
         </div>
-      </div>
-      <div class="form-row">
-        <label for="acc-label">اسم تحب تنده بيه عليه (اختياري)</label>
-        <input class="field" id="acc-label" placeholder="لو سبته فاضي، هناخد اسمه من اللعبة">
       </div>
       <div class="form-row">
         <label for="acc-squad">المجموعة</label>
         <input class="field" id="acc-squad" list="squad-options" placeholder="المجموعة الأولى">
         <datalist id="squad-options"></datalist>
-        <div class="hint">الحسابات اللي في نفس المجموعة بتتحرّك مع بعض بأمر واحد.</div>
+        <div class="hint">
+          اختار من المجموعات الموجودة، أو اكتب اسم جديد وهيتعمل تلقائي.
+          الحسابات اللي في نفس المجموعة بتتحرّك مع بعض بأمر واحد.
+        </div>
       </div>
     </div>
     <div class="modal-foot">
