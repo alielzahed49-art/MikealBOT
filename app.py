@@ -584,11 +584,13 @@ class GameClient:
         raise GameError(_message_of(body) or f"العمل اترفض ({status})")
 
     def daily_quests(self):
-        data = self.get("/quests/daily")
+        """GET /quests (مش /quests/daily) — المسار الحقيقي من ملفك القديم."""
+        data = self.get("/quests")
         return data.get("quests", []) if isinstance(data, dict) else []
 
     def claim_quest(self, quest_key):
-        status, body = self.post("/quests/claim", {"quest": quest_key})
+        """POST /quests/{quest_key}/claim من غير body — المفتاح في الرابط نفسه."""
+        status, body = self.post(f"/quests/{quest_key}/claim", {})
         if status in (200, 201):
             return body
         raise GameError(_message_of(body) or "المكافأة مش متاحة")
@@ -873,12 +875,13 @@ def task_auto_perk(account, payload):
 
 def task_quests(account, payload):
     client = client_for(account)
+    quests = client.daily_quests()
     claimed = 0
-    for quest in client.daily_quests():
+    for quest in quests:
         if not isinstance(quest, dict):
             continue
-        key = quest.get("key") or quest.get("id")
-        if quest.get("completed") and not quest.get("claimed") and key:
+        key = quest.get("quest_key")
+        if quest.get("completed") and not quest.get("rewarded") and key:
             try:
                 client.claim_quest(key)
                 claimed += 1
@@ -1047,47 +1050,6 @@ KIND_LABELS = {
 }
 
 
-# لما ميزة دورية (مش أمر لمرة واحدة زي السفر) تفشل باستمرار — غالباً معناها
-# إن مسار API بتاعها غلط أو اتغيّر في اللعبة — نوقفها تلقائي بدل ما تفضل
-# تحاول للأبد وتضرب اللعبة والقاعدة بطلبات فاشلة كل نبضة
-_AUTO_FEATURE_TOGGLE = {
-    "quests": "auto_quests", "wheel": "auto_wheel", "work": "auto_work",
-    "military_auto": "auto_military", "pills_auto": "auto_pills",
-}
-FEATURE_FAIL_LIMIT = _int("FEATURE_FAIL_LIMIT", 3)
-
-
-def _note_feature_failure(account, kind, error_text):
-    toggle_field = _AUTO_FEATURE_TOGGLE.get(kind)
-    if not toggle_field:
-        return
-    counts = dict(account.get("feature_fail_counts") or {})
-    counts[kind] = counts.get(kind, 0) + 1
-
-    if counts[kind] >= FEATURE_FAIL_LIMIT:
-        counts[kind] = 0
-        db_execute(f"UPDATE accounts SET {toggle_field}=FALSE, feature_fail_counts=%s::jsonb "
-                  "WHERE id=%s", (json.dumps(counts), account["id"]))
-        add_log(
-            f"{account_title(account)}: {KIND_LABELS.get(kind, kind)} اتوقفت تلقائي بعد "
-            f"{FEATURE_FAIL_LIMIT} محاولات فاشلة متتالية — المشكلة: {error_text}",
-            "error", account["id"])
-    else:
-        db_execute("UPDATE accounts SET feature_fail_counts=%s::jsonb WHERE id=%s",
-                  (json.dumps(counts), account["id"]))
-
-
-def _note_feature_success(account, kind):
-    toggle_field = _AUTO_FEATURE_TOGGLE.get(kind)
-    if not toggle_field:
-        return
-    counts = dict(account.get("feature_fail_counts") or {})
-    if counts.get(kind):
-        counts[kind] = 0
-        db_execute("UPDATE accounts SET feature_fail_counts=%s::jsonb WHERE id=%s",
-                  (json.dumps(counts), account["id"]))
-
-
 def run_task(task):
     account = get_account(task["account_id"])
     if not account:
@@ -1114,7 +1076,6 @@ def run_task(task):
             "UPDATE tasks SET status='done', result=%s, attempts=attempts+1 WHERE id=%s",
             ((message or "تم")[:300], task["id"]))
         mark_ok(account, f"{title}: {message}" if message else None)
-        _note_feature_success(account, task["kind"])
 
     except TokenInvalid as e:
         db_execute(
@@ -1135,7 +1096,6 @@ def run_task(task):
             db_execute("UPDATE tasks SET status='failed', attempts=%s, result=%s WHERE id=%s",
                        (attempts, str(e)[:300], task["id"]))
             mark_error(account, f"{title}: {e}")
-            _note_feature_failure(account, task["kind"], str(e))
 
     except Exception as e:
         log.exception("خطأ غير متوقع في المهمة %s", task["id"])
@@ -1143,7 +1103,6 @@ def run_task(task):
             "UPDATE tasks SET status='failed', attempts=attempts+1, result=%s WHERE id=%s",
             (f"{type(e).__name__}: {e}"[:300], task["id"]))
         mark_error(account, f"{title}: خطأ داخلي — {type(e).__name__}")
-        _note_feature_failure(account, task["kind"], f"{type(e).__name__}: {e}")
 
 
 def _queue_if_free(account_id, kind, min_gap_minutes=0):
@@ -1773,7 +1732,7 @@ function togglePick(id, on) {
 function renderPickState() {
   const n = state.selected.size;
   $('pick-count').textContent = n ? `${n} مختار` : 'مفيش اختيار';
-  ['btn-travel', 'btn-refresh', 'btn-plan']
+  ['btn-travel', 'btn-refresh', 'btn-plan', 'btn-enable-selected', 'btn-disable-selected']
     .forEach((id) => { $(id).disabled = n === 0; });
 }
 
@@ -1816,6 +1775,23 @@ async function runGroup(kind, payload = {}, spread = true) {
     toast(r.note);
     setTimeout(loadState, 1500);
   } catch (e) { toast(e.message, true); }
+}
+
+async function bulkSetEnabled(enabled) {
+  const ids = [...state.selected];
+  if (!ids.length) return toast('اختار حسابات الأول', true);
+  const results = await Promise.allSettled(
+    ids.map((id) => api(`/api/accounts/${id}`, {
+      method: 'PATCH', body: JSON.stringify({ enabled }),
+    }))
+  );
+  const ok = results.filter((r) => r.status === 'fulfilled').length;
+  const failed = results.length - ok;
+  toast(failed
+    ? `${enabled ? 'اتشغّل' : 'اتوقّف'} ${ok} من ${ids.length} — فشل ${failed}`
+    : `${enabled ? 'اتشغّلوا' : 'اتوقّفوا'} ${ok} حساب`,
+    failed > 0 && ok === 0);
+  await loadState();
 }
 
 function openAccountModal(id = null) {
@@ -2146,6 +2122,8 @@ function bind() {
   $('px-test').onclick = testProxy;
   $('tr-search').oninput = renderCountries;
 
+  $('btn-enable-selected').onclick = () => bulkSetEnabled(true);
+  $('btn-disable-selected').onclick = () => bulkSetEnabled(false);
   $('btn-travel').onclick = openTravelModal;
   $('btn-plan').onclick = openPlanModal;
   $('btn-refresh').onclick = () => runGroup('refresh', {}, false);
@@ -2288,6 +2266,8 @@ INDEX_HTML = """<!DOCTYPE html>
       <button class="btn btn-sm" id="btn-select-none">إلغاء الاختيار</button>
       <span class="command-count" id="pick-count">مفيش اختيار</span>
       <div class="topbar-spacer"></div>
+      <button class="btn btn-go btn-sm" id="btn-enable-selected" disabled>تشغيل المحدد</button>
+      <button class="btn btn-sm btn-danger" id="btn-disable-selected" disabled>إيقاف المحدد</button>
       <button class="btn btn-go btn-sm" id="btn-travel" disabled>الدول والسفر</button>
       <button class="btn btn-sm" id="btn-plan" disabled>خطة تطوير</button>
       <button class="btn btn-sm" id="btn-refresh" disabled>تحديث البيانات</button>
