@@ -1740,6 +1740,7 @@ async function patchAccount(id, changes) {
   try {
     await api(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(changes) });
     await loadState();
+    if (changes.enabled === true) setTimeout(loadState, 2000);  // نلحق نشوف العدّاد أول ما يتحسب
   } catch (e) { toast(e.message, true); loadState(); }
 }
 
@@ -1792,6 +1793,7 @@ async function bulkSetEnabled(enabled) {
     : `${enabled ? 'اتشغّلوا' : 'اتوقّفوا'} ${ok} حساب`,
     failed > 0 && ok === 0);
   await loadState();
+  if (enabled) setTimeout(loadState, 2000);
 }
 
 function openAccountModal(id = null) {
@@ -2684,9 +2686,14 @@ def api_update_account(account_id):
             sets.append(f"{field}=%s")
             params.append(bool(data.get(field)))
 
-    # لو الحساب بيتوقف، امسح عدّاد التطوير على طول — مش هيحصل حاجة فعلياً
+    # لو الحساب بيتوقف، امسح عدّاد التطوير على طول — مش هيحصل حاجة فعلياً.
+    # وأهم من كده: نلغي أي مهمة "تطوير مستمر" لسه محجوزة بميعاد قديم بعيد،
+    # عشان لو الحساب اتشغّل تاني بسرعة منستناش المهمة القديمة دي تجيلها دورها
     if "enabled" in data and not data.get("enabled"):
         sets.append("perk_next_at=NULL")
+        db_execute(
+            "DELETE FROM tasks WHERE account_id=%s AND kind='auto_perk' AND status='pending'",
+            (account_id,))
 
     # البروكسي بيتبعت كسطر واحد "عنوان:منفذ:يوزر:باسورد" ونفكّه هنا
     if "proxy_line" in data:
@@ -2727,6 +2734,11 @@ def api_update_account(account_id):
         db_execute("UPDATE accounts SET status='idle', last_error='' WHERE id=%s", (account_id,))
         queue_task(account_id, "refresh")
         threading.Thread(target=run_tick, args=("token_updated",), daemon=True).start()
+
+    # لو الحساب اتشغّل دلوقتي، منستناش النبضة الجاية — نبدأ سلسلة التطوير
+    # (وأي ميزة تانية مفعّلة) على طول عشان العدّاد يظهر فوراً
+    if data.get("enabled") and not account["enabled"]:
+        threading.Thread(target=run_tick, args=("account_enabled",), daemon=True).start()
 
     return jsonify({"ok": True})
 
