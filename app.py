@@ -995,11 +995,16 @@ def task_plan_step(account, payload):
     try:
         client.upgrade_skill(skill_key, currency)
     except AlreadyUpgrading as e:
-        # لسه فيه ترقية شغّالة (مش بالضرورة من الخطة — ممكن حد بدأ ترقية يدوي) —
-        # منعدّش الخطوة دي فاشلة، نستنى بس ونجرب تاني بعد الوقت اللي اللعبة قالته
+        # لسه فيه ترقية شغّالة (مش بالضرورة من الخطة — ممكن حد بدأ ترقية يدوي أو
+        # فيه تطوير مستمر كان شغّال قبل ما الخطة تبدأ) — منعدّش الخطوة دي فاشلة،
+        # نستنى بس ونجرب تاني بعد الوقت اللي اللعبة قالته، ونوري العدّاد للمستخدم
+        next_at = now() + timedelta(seconds=e.remaining_seconds)
+        db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s", (next_at, account["id"]))
         queue_task(account["id"], "plan_step", delay_seconds=e.remaining_seconds)
         return None
     except RateLimited as e:
+        next_at = now() + timedelta(seconds=e.retry_after)
+        db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s", (next_at, account["id"]))
         queue_task(account["id"], "plan_step", delay_seconds=e.retry_after)
         return None
 
@@ -1010,7 +1015,8 @@ def task_plan_step(account, payload):
         next_idx, next_done = idx, done_after
 
     if next_idx >= len(steps):
-        db_execute("UPDATE accounts SET upgrade_plan=NULL WHERE id=%s", (account["id"],))
+        db_execute("UPDATE accounts SET upgrade_plan=NULL, perk_next_at=NULL WHERE id=%s",
+                  (account["id"],))
         return f"خطة التطوير خلصت بالكامل — آخر خطوة: {label} ({done_after}/{count})"
 
     plan["step_index"], plan["done_in_step"] = next_idx, next_done
@@ -1022,6 +1028,8 @@ def task_plan_step(account, payload):
         wait_s = skill_cooldown_seconds(client.profile()) or 65
     except Exception:
         wait_s = 65
+    next_at = now() + timedelta(seconds=wait_s)
+    db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s", (next_at, account["id"]))
     queue_task(account["id"], "plan_step", delay_seconds=wait_s)
 
     return f"ترقية {label} ({done_after}/{count})"
@@ -1078,12 +1086,22 @@ def run_task(task):
         mark_ok(account, f"{title}: {message}" if message else None)
 
     except TokenInvalid as e:
-        db_execute(
-            "UPDATE tasks SET status='failed', result=%s, attempts=attempts+1 WHERE id=%s",
-            (str(e), task["id"]))
-        db_execute("UPDATE accounts SET enabled=FALSE, auto_upgrade=FALSE WHERE id=%s",
-                   (account["id"],))
-        mark_error(account, f"{title}: التوكن مرفوض — الحساب اتوقّف لحد ما تجدّده")
+        attempts = task["attempts"] + 1
+        if attempts < 3:
+            # ممكن يكون هبوط شبكة لحظي أو حظر مؤقت من الحماية، مش توكن حقيقي
+            # منتهي — منوقّفش الحساب غير بعد ما نتأكد بمحاولات كذا
+            db_execute("UPDATE tasks SET attempts=%s, run_at=%s, result=%s WHERE id=%s",
+                       (attempts, now() + timedelta(minutes=3 * attempts),
+                        str(e)[:300], task["id"]))
+            add_log(f"{title}: {e} — هنتأكد بمحاولة تانية قبل ما نوقف الحساب",
+                   "warn", account["id"])
+        else:
+            db_execute(
+                "UPDATE tasks SET status='failed', result=%s, attempts=%s WHERE id=%s",
+                (str(e), attempts, task["id"]))
+            db_execute("UPDATE accounts SET enabled=FALSE, auto_upgrade=FALSE WHERE id=%s",
+                       (account["id"],))
+            mark_error(account, f"{title}: التوكن مرفوض بعد {attempts} محاولات — الحساب اتوقّف لحد ما تجدّده")
 
     except GameError as e:
         attempts = task["attempts"] + 1
