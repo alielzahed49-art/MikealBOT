@@ -1086,21 +1086,12 @@ def run_task(task):
         mark_ok(account, f"{title}: {message}" if message else None)
 
     except TokenInvalid as e:
-        attempts = task["attempts"] + 1
-        if attempts < 3:
-            # ممكن يكون هبوط شبكة لحظي أو حظر مؤقت من الحماية، مش توكن حقيقي
-            # منتهي — منسجّلش خطأ نهائي غير بعد ما نتأكد بمحاولات كذا
-            db_execute("UPDATE tasks SET attempts=%s, run_at=%s, result=%s WHERE id=%s",
-                       (attempts, now() + timedelta(minutes=3 * attempts),
-                        str(e)[:300], task["id"]))
-            add_log(f"{title}: {e} — هنتأكد بمحاولة تانية", "warn", account["id"])
-        else:
-            # الحساب مش بيتوقف — بس بنسجّل الخطأ عشان تعرف إنك محتاج تجدّد
-            # التوكن. النبضة الجاية هتحاول تاني لوحدها من غير أي تدخّل منك
-            db_execute(
-                "UPDATE tasks SET status='failed', result=%s, attempts=%s WHERE id=%s",
-                (str(e), attempts, task["id"]))
-            mark_error(account, f"{title}: التوكن مرفوض بعد {attempts} محاولات — جدّده من تعديل (الحساب فاضل شغّال وهيعيد المحاولة لوحده)")
+        db_execute(
+            "UPDATE tasks SET status='failed', result=%s, attempts=attempts+1 WHERE id=%s",
+            (str(e), task["id"]))
+        kind_label = KIND_LABELS.get(task["kind"], task["kind"])
+        mark_error(account, f"{title}: التوكن مرفوض ({kind_label}) — جدّده من تعديل لو مستمر"
+                            " (الحساب فاضل شغّال والنبضة الجاية هتحاول تاني لوحدها)")
 
     except GameError as e:
         attempts = task["attempts"] + 1
