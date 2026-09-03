@@ -1192,9 +1192,12 @@ def schedule_periodic():
     # الميعاد من المهمة نفسها بدل ما نسيب المستخدم يشوف الشارة فاضية
     stale_countdown = db_all(
         """SELECT a.id AS account_id, t.run_at FROM accounts a
-           JOIN tasks t ON t.account_id = a.id
-             AND t.kind='auto_perk' AND t.status='pending'
-           WHERE a.perk_next_at IS NULL AND a.upgrade_plan IS NULL AND a.enabled=TRUE""")
+           JOIN tasks t ON t.account_id = a.id AND t.status='pending'
+             AND (
+               (t.kind='auto_perk' AND a.upgrade_plan IS NULL AND a.enabled=TRUE)
+               OR (t.kind='plan_step' AND a.upgrade_plan IS NOT NULL)
+             )
+           WHERE a.perk_next_at IS NULL""")
     for row in stale_countdown:
         db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
                   (row["run_at"], row["account_id"]))
@@ -2133,7 +2136,7 @@ function renderLog() {
   }
   $('log').innerHTML = state.logs.map((l) => {
     const t = new Date(l.ts);
-    const hhmm = t.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const hhmm = t.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
     return `<div class="log-row ${esc(l.level)}">
       <time>${hhmm}</time><span class="msg">${esc(l.message)}</span>
     </div>`;
@@ -2190,14 +2193,14 @@ function bind() {
 // عدّاد تنازلي حي زي بتاع اللعبة نفسها — بيتحدّث كل ثانية على جهازك بس،
 // من غير أي طلب سيرفر إضافي (بيستخدم الوقت اللي وصل أصلاً مع آخر تحديث)
 function formatCountdown(ms) {
-  if (ms <= 0) return 'دلوقتي تقريباً';
+  if (ms <= 0) return 'now';
   const totalSeconds = Math.floor(ms / 1000);
   const h = Math.floor(totalSeconds / 3600);
   const m = Math.floor((totalSeconds % 3600) / 60);
   const s = totalSeconds % 60;
-  if (h > 0) return `${h}س ${m}د ${s}ث`;
-  if (m > 0) return `${m}د ${s}ث`;
-  return `${s}ث`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 function tickCountdowns() {
@@ -2719,7 +2722,10 @@ def api_update_account(account_id):
     # وأهم من كده: نلغي أي مهمة "تطوير مستمر" لسه محجوزة بميعاد قديم بعيد،
     # عشان لو الحساب اتشغّل تاني بسرعة منستناش المهمة القديمة دي تجيلها دورها
     if "enabled" in data and not data.get("enabled"):
-        sets.append("perk_next_at=NULL")
+        # الخطة (لو فيه واحدة شغّالة) بتفضل تشتغل حتى لو الحساب موقوف، فمنمسحش
+        # عدّادها — بس التطوير المستمر العادي بيقف فعلاً فده اللي بنمسحه
+        if not account.get("upgrade_plan"):
+            sets.append("perk_next_at=NULL")
         db_execute(
             "DELETE FROM tasks WHERE account_id=%s AND kind='auto_perk' AND status='pending'",
             (account_id,))
