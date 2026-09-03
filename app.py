@@ -1089,19 +1089,18 @@ def run_task(task):
         attempts = task["attempts"] + 1
         if attempts < 3:
             # ممكن يكون هبوط شبكة لحظي أو حظر مؤقت من الحماية، مش توكن حقيقي
-            # منتهي — منوقّفش الحساب غير بعد ما نتأكد بمحاولات كذا
+            # منتهي — منسجّلش خطأ نهائي غير بعد ما نتأكد بمحاولات كذا
             db_execute("UPDATE tasks SET attempts=%s, run_at=%s, result=%s WHERE id=%s",
                        (attempts, now() + timedelta(minutes=3 * attempts),
                         str(e)[:300], task["id"]))
-            add_log(f"{title}: {e} — هنتأكد بمحاولة تانية قبل ما نوقف الحساب",
-                   "warn", account["id"])
+            add_log(f"{title}: {e} — هنتأكد بمحاولة تانية", "warn", account["id"])
         else:
+            # الحساب مش بيتوقف — بس بنسجّل الخطأ عشان تعرف إنك محتاج تجدّد
+            # التوكن. النبضة الجاية هتحاول تاني لوحدها من غير أي تدخّل منك
             db_execute(
                 "UPDATE tasks SET status='failed', result=%s, attempts=%s WHERE id=%s",
                 (str(e), attempts, task["id"]))
-            db_execute("UPDATE accounts SET enabled=FALSE, auto_upgrade=FALSE WHERE id=%s",
-                       (account["id"],))
-            mark_error(account, f"{title}: التوكن مرفوض بعد {attempts} محاولات — الحساب اتوقّف لحد ما تجدّده")
+            mark_error(account, f"{title}: التوكن مرفوض بعد {attempts} محاولات — جدّده من تعديل (الحساب فاضل شغّال وهيعيد المحاولة لوحده)")
 
     except GameError as e:
         attempts = task["attempts"] + 1
@@ -1187,6 +1186,18 @@ def schedule_periodic():
     for account in planning:
         if _queue_if_free(account["id"], "plan_step"):
             added += 1
+
+    # شفاء ذاتي: حسابات كانت شغّالة قبل ميزة العدّاد الحي، أو أي حالة تانية
+    # فيها مهمة "تطوير مستمر" منتظرة بالفعل بس مفيش عدّاد متسجّل — نجيب
+    # الميعاد من المهمة نفسها بدل ما نسيب المستخدم يشوف الشارة فاضية
+    stale_countdown = db_all(
+        """SELECT a.id AS account_id, t.run_at FROM accounts a
+           JOIN tasks t ON t.account_id = a.id
+             AND t.kind='auto_perk' AND t.status='pending'
+           WHERE a.perk_next_at IS NULL AND a.upgrade_plan IS NULL AND a.enabled=TRUE""")
+    for row in stale_countdown:
+        db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
+                  (row["run_at"], row["account_id"]))
 
     return added
 
