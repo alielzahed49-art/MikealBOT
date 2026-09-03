@@ -1697,7 +1697,7 @@ function cardHtml(a) {
     <div class="hint" style="margin:-4px 0 8px">دوس على مهارة تختارها — لو الحساب "شغّال" هتتطور باستمرار لوحدها</div>
     ${a.perk_next_at ? `
     <div class="countdown-badge" data-until="${a.perk_next_at}">
-      ⏳ <span class="cd-label">الترقية الجاية خلال</span> <span class="cd-text" dir="ltr">…</span>
+      ⏳ <span class="cd-label">الترقية الجاية خلال</span> <span class="cd-text" dir="ltr">${formatCountdown(new Date(a.perk_next_at).getTime() - Date.now())}</span>
     </div>` : ''}
 
     <div class="selects">
@@ -3122,6 +3122,12 @@ def bootstrap():
         _started = True
 
     ensure_db()
+    if _db_ready:
+        # نبضة فورية أول ما السيرفر يشتغل — عشان الإصلاحات الذاتية (زي عدّاد
+        # التطوير) تشتغل على طول بعد أي نشر جديد، من غير ما نستنى أول دورة
+        # تلقائية (ممكن تاخد لحد دقيقتين) أو نحتاج نضغط تحديث يدوي
+        threading.Thread(target=run_tick, args=("startup",), daemon=True).start()
+
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(run_tick, "interval", seconds=TICK_SECONDS, id="tick",
                       max_instances=1, coalesce=True)
