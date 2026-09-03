@@ -891,12 +891,30 @@ def task_quests(account, payload):
 
 
 def task_wheel(account, payload):
+    """
+    بيلف كل اللفات المجانية المتاحة دفعة واحدة (زي ملفك القديم بالظبط) —
+    مش لفة واحدة بس. لو اللعبة رجّعت رد غير متوقع (زي طلب تأكيد دفع)،
+    بنوقف على طول من غير ما نكمل — ده برّه نطاق اللف المجاني الأوتوماتيكي.
+    """
     client = client_for(account)
     state = client.wheel_state()
-    if not state.get("enabled") or (state.get("free_left") or 0) <= 0:
+    if not state.get("enabled") or state.get("locked"):
         return None
-    client.spin_wheel()
-    return "لفّ العجلة المجانية"
+
+    free_left = state.get("free_left") or 0
+    spun = 0
+    while free_left > 0:
+        try:
+            resp = client.spin_wheel()
+        except GameError:
+            break  # ممكن السيرفر يطلب تأكيد دفع أو أي حاجة برّه نطاق اللف المجاني
+        if not (isinstance(resp, dict) and resp.get("success")):
+            break
+        spun += 1
+        next_free = resp.get("free_left")
+        free_left = next_free if next_free is not None else free_left - 1
+
+    return f"لفّ العجلة المجانية {spun} مرة" if spun else None
 
 
 def task_work(account, payload):
@@ -1057,6 +1075,13 @@ KIND_LABELS = {
     "military_auto": "انضمام عسكري", "plan_step": "خطوة من خطة تطوير",
 }
 
+# الميزات دي "جانبية" — بتشتغل من نفسها كل شوية، وغالباً بترفض بسبب حد يومي
+# (زي "خلصت لفّات العجلة النهاردة") مش لأن التوكن فعلاً بايظ. رفض هنا مش لازم
+# يتحط كـ"توكن مرفوض" مخيف — كفاية نسجّله كملاحظة عادية ونكمل. الحساب الأساسي
+# (تحديث البيانات) والأوامر اللي إنت طلبتها بنفسك (سفر، فيزا، تطوير) لسه
+# بتتعامل مع رفض التوكن بجدّية زي ما هي
+_AMBIENT_KINDS = {"wheel", "quests", "work", "military_auto", "pills_auto"}
+
 
 def run_task(task):
     account = get_account(task["account_id"])
@@ -1090,20 +1115,27 @@ def run_task(task):
             "UPDATE tasks SET status='failed', result=%s, attempts=attempts+1 WHERE id=%s",
             (str(e), task["id"]))
         kind_label = KIND_LABELS.get(task["kind"], task["kind"])
-        mark_error(account, f"{title}: التوكن مرفوض ({kind_label}) — جدّده من تعديل لو مستمر"
-                            " (الحساب فاضل شغّال والنبضة الجاية هتحاول تاني لوحدها)")
+        if task["kind"] not in _AMBIENT_KINDS:
+            # مش توكن حقيقي بايظ غالباً في الميزات الجانبية (زي حد يومي خلص
+            # أو حماية اللعبة من كتر الطلبات) — منسجّلش أي حاجة ليها خالص،
+            # المهم إنها تفضل تشتغل جوه اللعبة مش إننا نوثّق كل رفضة
+            mark_error(account, f"{title}: التوكن مرفوض ({kind_label}) — جدّده من تعديل لو مستمر"
+                                " (الحساب فاضل شغّال والنبضة الجاية هتحاول تاني لوحدها)")
 
     except GameError as e:
         attempts = task["attempts"] + 1
+        is_ambient = task["kind"] in _AMBIENT_KINDS
         if attempts < 3:
             db_execute("UPDATE tasks SET attempts=%s, run_at=%s, result=%s WHERE id=%s",
                        (attempts, now() + timedelta(minutes=5 * attempts),
                         str(e)[:300], task["id"]))
-            add_log(f"{title}: {e} — هنعيد المحاولة", "warn", account["id"])
+            if not is_ambient:
+                add_log(f"{title}: {e} — هنعيد المحاولة", "warn", account["id"])
         else:
             db_execute("UPDATE tasks SET status='failed', attempts=%s, result=%s WHERE id=%s",
                        (attempts, str(e)[:300], task["id"]))
-            mark_error(account, f"{title}: {e}")
+            if not is_ambient:
+                mark_error(account, f"{title}: {e}")
 
     except Exception as e:
         log.exception("خطأ غير متوقع في المهمة %s", task["id"])
@@ -1144,10 +1176,10 @@ def schedule_periodic():
         if not account.get("upgrade_plan") and _queue_if_free(aid, "auto_perk"):
             added += 1
 
-        if account.get("auto_quests") and _queue_if_free(aid, "quests", 60):
+        if account.get("auto_quests") and _queue_if_free(aid, "quests", 480):
             added += 1
 
-        if account.get("auto_wheel") and _queue_if_free(aid, "wheel", 60):
+        if account.get("auto_wheel") and _queue_if_free(aid, "wheel", 480):
             added += 1
 
         if account.get("auto_work"):
