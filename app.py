@@ -1104,6 +1104,18 @@ def run_task(task):
         return
 
     title = account_title(account)
+    countdown_kinds = ("auto_perk", "plan_step")
+
+    def _bump_countdown(seconds):
+        """
+        العدّاد لازم يفضل صادق — لو مهمة تطوير فشلت لأي سبب، نحرّك ميعاد
+        المحاولة الجاية بدل ما نسيبه واقف على رقم قديم وهو فعلياً بيحاول
+        (ويفشل بصمت) في الخلفية كل شوية من غير ما يوضّح ده للمستخدم.
+        """
+        if task["kind"] in countdown_kinds:
+            db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
+                      (now() + timedelta(seconds=seconds), account["id"]))
+
     try:
         message = handler(account, task["payload"] or {})
         db_execute(
@@ -1122,24 +1134,32 @@ def run_task(task):
             # المهم إنها تفضل تشتغل جوه اللعبة مش إننا نوثّق كل رفضة
             mark_error(account, f"{title}: التوكن مرفوض ({kind_label}) — جدّده من تعديل لو مستمر"
                                 " (الحساب فاضل شغّال والنبضة الجاية هتحاول تاني لوحدها)")
+        else:
+            # مفيش إعادة جدولة فورية هنا — النبضة الجاية (خلال دقيقتين) هي
+            # اللي هترجّع تحاول، فالعدّاد لازم يعكس الوقت ده بالظبط
+            _bump_countdown(TICK_SECONDS)
 
     except GameError as e:
         attempts = task["attempts"] + 1
         is_ambient = task["kind"] in _AMBIENT_KINDS
         if attempts < 3:
+            retry_seconds = 300 * attempts
             db_execute("UPDATE tasks SET attempts=%s, run_at=%s, result=%s WHERE id=%s",
-                       (attempts, now() + timedelta(minutes=5 * attempts),
+                       (attempts, now() + timedelta(seconds=retry_seconds),
                         str(e)[:300], task["id"]))
+            _bump_countdown(retry_seconds)
             if not is_ambient:
                 add_log(f"{title}: {e} — هنعيد المحاولة", "warn", account["id"])
         else:
             db_execute("UPDATE tasks SET status='failed', attempts=%s, result=%s WHERE id=%s",
                        (attempts, str(e)[:300], task["id"]))
+            _bump_countdown(TICK_SECONDS)
             if not is_ambient:
                 mark_error(account, f"{title}: {e}")
 
     except Exception as e:
         log.exception("خطأ غير متوقع في المهمة %s", task["id"])
+        _bump_countdown(TICK_SECONDS)
         db_execute(
             "UPDATE tasks SET status='failed', attempts=attempts+1, result=%s WHERE id=%s",
             (f"{type(e).__name__}: {e}"[:300], task["id"]))
