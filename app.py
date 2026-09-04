@@ -1080,7 +1080,8 @@ KIND_LABELS = {
 # يتحط كـ"توكن مرفوض" مخيف — كفاية نسجّله كملاحظة عادية ونكمل. الحساب الأساسي
 # (تحديث البيانات) والأوامر اللي إنت طلبتها بنفسك (سفر، فيزا، تطوير) لسه
 # بتتعامل مع رفض التوكن بجدّية زي ما هي
-_AMBIENT_KINDS = {"wheel", "quests", "work", "military_auto", "pills_auto"}
+_AMBIENT_KINDS = {"wheel", "quests", "work", "military_auto", "pills_auto",
+                  "auto_perk", "plan_step"}
 
 
 def run_task(task):
