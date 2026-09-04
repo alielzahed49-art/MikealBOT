@@ -212,6 +212,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     pills_limit   BIGINT NOT NULL DEFAULT 2500,
     perk_progress INTEGER NOT NULL DEFAULT 0,
     perk_next_at  TIMESTAMPTZ,
+    token_invalid BOOLEAN NOT NULL DEFAULT FALSE,
     perk_target   INTEGER,
     auto_military BOOLEAN NOT NULL DEFAULT FALSE,
     military_joined_until TIMESTAMPTZ,
@@ -284,6 +285,7 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS feature_fail_counts JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_progress INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_next_at TIMESTAMPTZ",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS token_invalid BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_target INTEGER",
 ]
 
@@ -1122,6 +1124,8 @@ def run_task(task):
             "UPDATE tasks SET status='done', result=%s, attempts=attempts+1 WHERE id=%s",
             ((message or "تم")[:300], task["id"]))
         mark_ok(account, f"{title}: {message}" if message else None)
+        if account.get("token_invalid"):
+            db_execute("UPDATE accounts SET token_invalid=FALSE WHERE id=%s", (account["id"],))
 
     except TokenInvalid as e:
         db_execute(
@@ -1132,6 +1136,7 @@ def run_task(task):
             # مش توكن حقيقي بايظ غالباً في الميزات الجانبية (زي حد يومي خلص
             # أو حماية اللعبة من كتر الطلبات) — منسجّلش أي حاجة ليها خالص،
             # المهم إنها تفضل تشتغل جوه اللعبة مش إننا نوثّق كل رفضة
+            db_execute("UPDATE accounts SET token_invalid=TRUE WHERE id=%s", (account["id"],))
             mark_error(account, f"{title}: التوكن مرفوض ({kind_label}) — جدّده من تعديل لو مستمر"
                                 " (الحساب فاضل شغّال والنبضة الجاية هتحاول تاني لوحدها)")
         else:
@@ -1697,6 +1702,7 @@ function cardHtml(a) {
       </div>
       <div class="card-title">
         <h3>${esc(a.label || a.game_name || 'حساب جديد')}</h3>
+        ${a.token_invalid ? '<span class="chip bad" style="margin-inline-start:6px">🔒 توكن منتهي</span>' : ''}
         <div class="sub">
           ${a.game_name ? esc(a.game_name) : 'لسه مجابش بيانات'}
           <span class="squad-tag">${esc(a.squad)}</span>
@@ -2659,6 +2665,7 @@ def _public_account(row):
         "perk": row["perk"], "currency": row["currency"],
         "perk_progress": row["perk_progress"],
         "perk_next_at": row["perk_next_at"].isoformat() if row["perk_next_at"] else None,
+        "token_invalid": row["token_invalid"],
         "auto_quests": row["auto_quests"],
         "auto_wheel": row["auto_wheel"], "auto_work": row["auto_work"],
         "auto_pills": row["auto_pills"], "pills_limit": row["pills_limit"],
@@ -2810,7 +2817,8 @@ def api_update_account(account_id):
     db_execute(f"UPDATE accounts SET {', '.join(sets)} WHERE id=%s", params)
 
     if data.get("token"):
-        db_execute("UPDATE accounts SET status='idle', last_error='' WHERE id=%s", (account_id,))
+        db_execute("UPDATE accounts SET status='idle', last_error='', token_invalid=FALSE WHERE id=%s",
+                  (account_id,))
         queue_task(account_id, "refresh")
         threading.Thread(target=run_tick, args=("token_updated",), daemon=True).start()
 
