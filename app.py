@@ -1,6 +1,6 @@
 """
 ================================================================================
-  لوحة ميكائيل — ملف واحد
+  لوحة تحكم بوت الألعاب — ملف واحد
 ================================================================================
   التشغيل محلياً:      python app.py
   التشغيل على Render:  gunicorn app:app --workers 1 --threads 8 --timeout 120
@@ -38,7 +38,7 @@ from psycopg2 import pool as pgpool
 from psycopg2.extras import RealDictCursor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("mikael")
+log = logging.getLogger("botpanel")
 
 
 # ==============================================================================
@@ -55,7 +55,7 @@ def _int(key, default):
 # رابط الـ Session Pooler من Supabase (مش الرابط المباشر — Render المجاني IPv4)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-OWNER_USER = os.environ.get("OWNER_USER", "mikael")
+OWNER_USER = os.environ.get("OWNER_USER", "admin")
 OWNER_PASS = os.environ.get("OWNER_PASS", "")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-change-me")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
@@ -84,7 +84,7 @@ MAX_PLAN_TOTAL_COUNT = _int("MAX_PLAN_TOTAL_COUNT", 1000)
 # أقصى وقت نسيب فيه شارة "بيسافر" ظاهرة من غير تأكيد وصول
 TRAVEL_TIMEOUT_MINUTES = _int("TRAVEL_TIMEOUT_MINUTES", 60)
 
-APP_NAME = os.environ.get("APP_NAME", "لوحة ميكائيل")
+APP_NAME = os.environ.get("APP_NAME", "لوحة تحكم البوت")
 
 PERKS = {
     "barracks":       {"key": "kisla",            "label": "الثكنات"},
@@ -2609,6 +2609,7 @@ app.config.update(
     SECRET_KEY=SECRET_KEY,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 30,
 )
 # من غير السطرين دول المفاتيح بتتّرتب أبجدياً، فترتيب القوايم في الواجهة بيتقلب
@@ -2707,7 +2708,7 @@ def dashboard():
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({"ok": True, "service": "mikael-bot"})
+    return jsonify({"ok": True, "service": "game-bot-panel"})
 
 
 # ── الحالة ───────────────────────────────────────────────
