@@ -213,6 +213,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     perk_progress INTEGER NOT NULL DEFAULT 0,
     perk_next_at  TIMESTAMPTZ,
     token_invalid BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_skill_active_perk TEXT,
     perk_target   INTEGER,
     auto_military BOOLEAN NOT NULL DEFAULT FALSE,
     military_joined_until TIMESTAMPTZ,
@@ -286,6 +287,7 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_progress INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_next_at TIMESTAMPTZ",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS token_invalid BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_skill_active_perk TEXT",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_target INTEGER",
 ]
 
@@ -579,11 +581,22 @@ class GameClient:
         raise GameError(_message_of(body) or f"التطوير التلقائي اترفض ({status})")
 
     def toggle_work(self):
-        """POST /auto/toggle {mode:'work'} — المسار الحقيقي اتأكّد من الشبكة."""
+        """
+        POST /auto/toggle {mode:'work'} — ده توجل حقيقي مش "تشغيل دايماً": لو
+        الشغل شغّال بالفعل، النداء ده هيقفله بدل ما يشغّله! لازم نتأكد من
+        الرد ولو رجع active:false نعيد النداء فوراً عشان نرجّعه شغّال.
+        """
         status, body = self.post("/auto/toggle", {"mode": "work"})
-        if status in (200, 201):
-            return body
-        raise GameError(_message_of(body) or f"العمل اترفض ({status})")
+        if status not in (200, 201):
+            raise GameError(_message_of(body) or f"العمل اترفض ({status})")
+
+        if isinstance(body, dict) and body.get("active") is False:
+            status2, body2 = self.post("/auto/toggle", {"mode": "work"})
+            if status2 in (200, 201):
+                return body2
+            raise GameError(_message_of(body2) or f"العمل اترفض ({status2})")
+
+        return body
 
     def daily_quests(self):
         """GET /quests (مش /quests/daily) — المسار الحقيقي من ملفك القديم."""
@@ -817,11 +830,12 @@ def task_residence(account, payload):
 
 def task_auto_perk(account, payload):
     """
-    تطوير مستمر للمهارة المختارة على الحساب (a.perk / a.currency) طول ما
-    الحساب "شغّال" — كل نجاح بيستنى الوقت الحقيقي اللي اللعبة بتحدده (من
-    بروفايل محدّث) قبل ما يحاول تاني، وهكذا للأبد لحد ما توقف الحساب أو
-    تبدأ خطة تطوير (اللي بتاخد الأولوية وتوقف السلسلة دي مؤقتاً).
-    بنسجّل perk_next_at بالظبط عشان الواجهة تعرض عدّاد تنازلي حي زي اللعبة.
+    تطوير مستمر — بيستخدم خاصية اللعبة الحقيقية POST /players/skills/auto/toggle
+    اللي بتفعّل المهارة المختارة تلقائياً لمدة ٢٤ ساعة تقريباً، بدل ما نبعت
+    طلبات ترقية منفصلة كل شوية. مهم: "until" اللي بيرجعه التوجل هو ميعاد
+    *تجديد الخاصية نفسها* بعد ٢٤ ساعة — مش ميعاد اكتمال المستوى الحالي، فمش
+    بنستخدمه كعدّاد ظاهر. العدّاد المفيد فعلاً (المستوى الجاي هيوصل إمتى)
+    بييجي من مهمة "perk_watch" المنفصلة اللي بتتابع البروفايل كل شوية.
     """
     if not account.get("enabled"):
         db_execute("UPDATE accounts SET perk_next_at=NULL WHERE id=%s", (account["id"],))
@@ -837,42 +851,85 @@ def task_auto_perk(account, payload):
         return None
 
     client = client_for(account)
-    try:
-        client.upgrade_skill(skill_key, currency)
-    except AlreadyUpgrading as e:
-        db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
-                  (now() + timedelta(seconds=e.remaining_seconds), account["id"]))
-        queue_task(account["id"], "auto_perk", delay_seconds=e.remaining_seconds)
-        return None
-    except RateLimited as e:
-        db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
-                  (now() + timedelta(seconds=e.retry_after), account["id"]))
-        queue_task(account["id"], "auto_perk", delay_seconds=e.retry_after)
-        return None
+    active_perk = account.get("auto_skill_active_perk")
 
-    progress = (account.get("perk_progress") or 0) + 1
-    label = PERKS[perk]["label"]
-    message = f"تطوير {label} ({progress})"
+    if active_perk and active_perk != perk:
+        # لو المهارة القديمة لسه في نص ترقية مستوى (يعني perk_next_at لسه
+        # ما خلصش)، منقفلهاش دلوقتي — ده ممكن يضيّع الاستثمار في المستوى
+        # اللي شغّال بالفعل. نستنى لحد ما يخلص لوحده، وبعدين نبدّل فعلياً
+        old_pending_until = account.get("perk_next_at")
+        if old_pending_until and old_pending_until > now():
+            wait_s = max(30, (old_pending_until - now()).total_seconds())
+            queue_task(account["id"], "auto_perk", delay_seconds=wait_s)
+            old_label = PERKS.get(active_perk, {}).get("label", active_perk)
+            new_label = PERKS[perk]["label"]
+            return f"هيتبدل لـ{new_label} أول ما {old_label} يخلص"
 
-    # نجيب بروفايل جديد — مرة واحدة بس — عشان (أ) نعرف الوقت الحقيقي للترقية
-    # الجاية و(ب) نحدّث كل الأرقام المعروضة (المستوى، مستويات المهارات...)
-    # على طول، بدل ما تفضل واقفة لحد "تحديث البيانات" اليدوي
-    try:
-        fresh_profile = client.profile()
-    except Exception:
-        fresh_profile = None
+        # المهارة القديمة فاضية دلوقتي (مفيش مستوى شغّال) — نقفلها الأول،
+        # نداء التوجل على نفس المهارة الشغّالة بيقفلها مش يجدّدها
+        old_key = PERK_KEYS.get(active_perk)
+        if old_key:
+            try:
+                client.toggle_auto_skill(old_key, currency)
+            except GameError:
+                pass  # يمكن خلصت مدتها وقفلت لوحدها في اللعبة أصلاً — عادي
 
-    if fresh_profile:
-        _apply_profile_snapshot(account["id"], account, fresh_profile)
-        wait_s = skill_cooldown_seconds(fresh_profile) or 65
-    else:
-        wait_s = 65
+    resp = client.toggle_auto_skill(skill_key, currency)
 
-    next_at = now() + timedelta(seconds=wait_s)
-    db_execute("UPDATE accounts SET perk_progress=%s, perk_next_at=%s WHERE id=%s",
-              (progress, next_at, account["id"]))
+    # التوجل بيقفل لو نادّيناه على مهارة شغّالة بالفعل (بدل ما يجدّدها) — لو
+    # حصل كده (يعني كانت شغّالة من غير ما نعرف)، نعيد النداء عشان تفضل شغّالة
+    if isinstance(resp, dict) and resp.get("active") is False:
+        resp = client.toggle_auto_skill(skill_key, currency)
+
+    renew_at = _parse_time(resp.get("until")) if isinstance(resp, dict) else None
+    if not renew_at:
+        renew_at = now() + timedelta(hours=24)
+
+    db_execute("UPDATE accounts SET auto_skill_active_perk=%s WHERE id=%s",
+              (perk, account["id"]))
+
+    wait_s = max(60, (renew_at - now()).total_seconds())
     queue_task(account["id"], "auto_perk", delay_seconds=wait_s)
-    return message
+
+    # نجيب تحديث فوري لميعاد اكتمال المستوى الحالي (العدّاد المفيد فعلاً)
+    # عشان يبان صح على طول من غير ما نستنى فحص "perk_watch" الجاي
+    try:
+        profile = client.profile()
+        _apply_profile_snapshot(account["id"], account, profile)
+        level_wait = skill_cooldown_seconds(profile)
+        if level_wait is not None:
+            db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
+                      (now() + timedelta(seconds=level_wait), account["id"]))
+    except Exception:
+        pass
+
+    label = PERKS[perk]["label"]
+    return f"تطوير {label} شغّال (٢٤ ساعة تقريباً)"
+
+
+def task_perk_watch(account, payload):
+    """
+    متابعة خفيفة كل شوية طول ما فيه مهارة شغّالة بالتوجل — بتجيب البروفايل
+    بس (من غير أي طلب ترقية أو توجل جديد) وتحدّث الأرقام المعروضة وميعاد
+    اكتمال المستوى الحالي. كده لما مستوى يخلص (مثلاً ١٦ لـ١٧)، الرقم بيتحدّث
+    لوحده خلال دقايق قليلة، مش لازم تستنى دورة الـ٢٤ ساعة تخلص وتتجدد.
+    """
+    if not account.get("enabled") or account.get("upgrade_plan"):
+        return None
+    if not account.get("auto_skill_active_perk"):
+        return None
+
+    try:
+        profile = client_for(account).profile()
+    except Exception:
+        return None
+
+    _apply_profile_snapshot(account["id"], account, profile)
+    level_wait = skill_cooldown_seconds(profile)
+    if level_wait is not None:
+        db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
+                  (now() + timedelta(seconds=level_wait), account["id"]))
+    return None
 
 
 def task_quests(account, payload):
@@ -1043,11 +1100,20 @@ def task_plan_step(account, payload):
     db_execute("UPDATE accounts SET upgrade_plan=%s::jsonb WHERE id=%s",
               (json.dumps(plan), account["id"]))
 
-    # نجيب الوقت الحقيقي من بروفايل محدّث بدل ما نخمّن
+    # نجيب بروفايل جديد — مرة واحدة بس — عشان (أ) نعرف الوقت الحقيقي للخطوة
+    # الجاية و(ب) نحدّث الأرقام المعروضة على طول بدل ما تفضل واقفة لحد
+    # "تحديث البيانات" اليدوي
     try:
-        wait_s = skill_cooldown_seconds(client.profile()) or 65
+        fresh_profile = client.profile()
     except Exception:
+        fresh_profile = None
+
+    if fresh_profile:
+        _apply_profile_snapshot(account["id"], account, fresh_profile)
+        wait_s = skill_cooldown_seconds(fresh_profile) or 65
+    else:
         wait_s = 65
+
     next_at = now() + timedelta(seconds=wait_s)
     db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s", (next_at, account["id"]))
     queue_task(account["id"], "plan_step", delay_seconds=wait_s)
@@ -1061,6 +1127,7 @@ HANDLERS = {
     "visa": task_visa,
     "residence": task_residence,
     "quests": task_quests,
+    "perk_watch": task_perk_watch,
     "auto_perk": task_auto_perk,
     "wheel": task_wheel,
     "work": task_work,
@@ -1072,6 +1139,7 @@ HANDLERS = {
 KIND_LABELS = {
     "refresh": "تحديث", "travel": "سفر", "visa": "طلب فيزا", "residence": "طلب إقامة",
     "quests": "مهام يومية",
+    "perk_watch": "متابعة تطوير",
     "auto_perk": "تطوير مستمر",
     "wheel": "عجلة", "work": "شغل", "pills_auto": "تحويل حبوب تلقائي",
     "military_auto": "انضمام عسكري", "plan_step": "خطوة من خطة تطوير",
@@ -1083,7 +1151,7 @@ KIND_LABELS = {
 # (تحديث البيانات) والأوامر اللي إنت طلبتها بنفسك (سفر، فيزا، تطوير) لسه
 # بتتعامل مع رفض التوكن بجدّية زي ما هي
 _AMBIENT_KINDS = {"wheel", "quests", "work", "military_auto", "pills_auto",
-                  "auto_perk", "plan_step"}
+                  "auto_perk", "plan_step", "perk_watch"}
 
 
 def run_task(task):
@@ -1202,6 +1270,13 @@ def schedule_periodic():
         if not account.get("upgrade_plan") and _queue_if_free(aid, "auto_perk"):
             added += 1
 
+        # متابعة خفيفة كل ٥ دقايق طول ما فيه مهارة شغّالة بالتوجل — عشان
+        # العدّاد والأرقام المعروضة تتحدّث لوحدها لما مستوى يخلص، من غير ما
+        # نستنى دورة الـ٢٤ ساعة تخلص وتتجدد
+        if (account.get("auto_skill_active_perk") and not account.get("upgrade_plan")
+                and _queue_if_free(aid, "perk_watch", 5)):
+            added += 1
+
         if account.get("auto_quests") and _queue_if_free(aid, "quests", 480):
             added += 1
 
@@ -1243,7 +1318,7 @@ def schedule_periodic():
         """SELECT a.id AS account_id, t.run_at FROM accounts a
            JOIN tasks t ON t.account_id = a.id AND t.status='pending'
              AND (
-               (t.kind='auto_perk' AND a.upgrade_plan IS NULL AND a.enabled=TRUE)
+               (t.kind='perk_watch' AND a.upgrade_plan IS NULL AND a.enabled=TRUE)
                OR (t.kind='plan_step' AND a.upgrade_plan IS NOT NULL)
              )
            WHERE a.perk_next_at IS NULL""")
@@ -1583,11 +1658,13 @@ function notifyPerkChanges(oldAccounts, newAccounts) {
   const oldById = new Map(oldAccounts.map((a) => [a.id, a]));
   for (const a of newAccounts) {
     const before = oldById.get(a.id);
-    if (!before) continue;
+    if (!before || before.perk !== a.perk) continue;
 
-    if (before.perk === a.perk && a.perk_progress > before.perk_progress) {
+    const oldLevel = currentSkillLevel(before, a.perk);
+    const newLevel = currentSkillLevel(a, a.perk);
+    if (oldLevel !== null && newLevel !== null && newLevel > oldLevel) {
       const label = window.PERKS[a.perk]?.label || a.perk;
-      toast(`✅ ${a.label || a.game_name || 'حساب'}: اتطوّرت ${label} (${a.perk_progress})`);
+      toast(`✅ ${a.label || a.game_name || 'حساب'}: اتطوّرت ${label} (${oldLevel} → ${newLevel})`);
     }
   }
 }
@@ -2826,6 +2903,17 @@ def api_update_account(account_id):
     # (وأي ميزة تانية مفعّلة) على طول عشان العدّاد يظهر فوراً
     if data.get("enabled") and not account["enabled"]:
         threading.Thread(target=run_tick, args=("account_enabled",), daemon=True).start()
+
+    # لو المهارة اتغيّرت يدوي والحساب شغّال من غير خطة تطوير، منستناش لحد
+    # الدورة الجاية (ممكن تكون بعد ٢٤ ساعة) — نبدّل فوراً: نلغي أي مهمة
+    # منتظرة بميعاد قديم، ونحط واحدة فورية تقفل المهارة القديمة وتفتح الجديدة
+    if ("perk" in data and data.get("perk") != account["perk"]
+            and account["enabled"] and not account.get("upgrade_plan")):
+        db_execute(
+            "DELETE FROM tasks WHERE account_id=%s AND kind='auto_perk' AND status='pending'",
+            (account_id,))
+        queue_task(account_id, "auto_perk")
+        threading.Thread(target=run_tick, args=("perk_switched",), daemon=True).start()
 
     return jsonify({"ok": True})
 
