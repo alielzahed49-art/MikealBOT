@@ -1,6 +1,6 @@
 """
 ================================================================================
-  لوحة تحكم بوت الألعاب — ملف واحد
+  لوحة ميكائيل — ملف واحد
 ================================================================================
   التشغيل محلياً:      python app.py
   التشغيل على Render:  gunicorn app:app --workers 1 --threads 8 --timeout 120
@@ -38,7 +38,7 @@ from psycopg2 import pool as pgpool
 from psycopg2.extras import RealDictCursor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("botpanel")
+log = logging.getLogger("mikael")
 
 
 # ==============================================================================
@@ -55,7 +55,7 @@ def _int(key, default):
 # رابط الـ Session Pooler من Supabase (مش الرابط المباشر — Render المجاني IPv4)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-OWNER_USER = os.environ.get("OWNER_USER", "admin")
+OWNER_USER = os.environ.get("OWNER_USER", "mikael")
 OWNER_PASS = os.environ.get("OWNER_PASS", "")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-change-me")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
@@ -84,7 +84,7 @@ MAX_PLAN_TOTAL_COUNT = _int("MAX_PLAN_TOTAL_COUNT", 1000)
 # أقصى وقت نسيب فيه شارة "بيسافر" ظاهرة من غير تأكيد وصول
 TRAVEL_TIMEOUT_MINUTES = _int("TRAVEL_TIMEOUT_MINUTES", 60)
 
-APP_NAME = os.environ.get("APP_NAME", "لوحة تحكم البوت")
+APP_NAME = os.environ.get("APP_NAME", "لوحة ميكائيل")
 
 PERKS = {
     "barracks":       {"key": "kisla",            "label": "الثكنات"},
@@ -212,8 +212,6 @@ CREATE TABLE IF NOT EXISTS accounts (
     pills_limit   BIGINT NOT NULL DEFAULT 2500,
     perk_progress INTEGER NOT NULL DEFAULT 0,
     perk_next_at  TIMESTAMPTZ,
-    token_invalid BOOLEAN NOT NULL DEFAULT FALSE,
-    auto_skill_active_perk TEXT,
     perk_target   INTEGER,
     auto_military BOOLEAN NOT NULL DEFAULT FALSE,
     military_joined_until TIMESTAMPTZ,
@@ -286,8 +284,6 @@ MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS feature_fail_counts JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_progress INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_next_at TIMESTAMPTZ",
-    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS token_invalid BOOLEAN NOT NULL DEFAULT FALSE",
-    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_skill_active_perk TEXT",
     "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS perk_target INTEGER",
 ]
 
@@ -581,22 +577,11 @@ class GameClient:
         raise GameError(_message_of(body) or f"التطوير التلقائي اترفض ({status})")
 
     def toggle_work(self):
-        """
-        POST /auto/toggle {mode:'work'} — ده توجل حقيقي مش "تشغيل دايماً": لو
-        الشغل شغّال بالفعل، النداء ده هيقفله بدل ما يشغّله! لازم نتأكد من
-        الرد ولو رجع active:false نعيد النداء فوراً عشان نرجّعه شغّال.
-        """
+        """POST /auto/toggle {mode:'work'} — المسار الحقيقي اتأكّد من الشبكة."""
         status, body = self.post("/auto/toggle", {"mode": "work"})
-        if status not in (200, 201):
-            raise GameError(_message_of(body) or f"العمل اترفض ({status})")
-
-        if isinstance(body, dict) and body.get("active") is False:
-            status2, body2 = self.post("/auto/toggle", {"mode": "work"})
-            if status2 in (200, 201):
-                return body2
-            raise GameError(_message_of(body2) or f"العمل اترفض ({status2})")
-
-        return body
+        if status in (200, 201):
+            return body
+        raise GameError(_message_of(body) or f"العمل اترفض ({status})")
 
     def daily_quests(self):
         """GET /quests (مش /quests/daily) — المسار الحقيقي من ملفك القديم."""
@@ -799,25 +784,6 @@ def task_refresh(account, payload):
     return f"البيانات اتحدّثت — المستوى {data['level_num']}"
 
 
-def _sync_refresh(account):
-    """
-    بيجيب بروفايل الحساب فوراً جوه نفس الطلب (من غير Thread خلفي ولا انتظار
-    نبضة) — عشان الواجهة تلاقي البيانات (الاسم، المستوى، المهارات...) جاهزة
-    على طول بمجرد ما حفظ التوكن، من غير أي تأخير أو تحديث يدوي. مش بيرفع
-    أي استثناء — أي مشكلة بتتسجّل كخطأ عادي على الحساب زي أي مهمة تانية.
-    """
-    try:
-        profile = client_for(account).profile()
-        _apply_profile_snapshot(account["id"], account, profile)
-        mark_ok(account)
-    except TokenInvalid as e:
-        mark_error(account, f"{account_title(account)}: التوكن مرفوض — {e}")
-    except GameError as e:
-        mark_error(account, f"{account_title(account)}: {e}")
-    except Exception as e:
-        mark_error(account, f"{account_title(account)}: خطأ داخلي — {type(e).__name__}")
-
-
 def task_travel(account, payload):
     destination = payload.get("destination")
     if not destination:
@@ -850,11 +816,10 @@ def task_residence(account, payload):
 def task_auto_perk(account, payload):
     """
     تطوير مستمر للمهارة المختارة على الحساب (a.perk / a.currency) طول ما
-    الحساب "شغّال" — نفس منطق "خطة تطوير" بالظبط (طلب ترقية فردي، بدون
-    خاصية الـ٢٤ ساعة بتاعت اللعبة)، بس من غير عدد خطوات محدد. كل نجاح
-    بيستنى الوقت الحقيقي اللي اللعبة بتحدده (من بروفايل محدّث) قبل ما
-    يحاول تاني — نفس عدّاد اللعبة نفسها بالظبط — وهكذا للأبد لحد ما توقف
-    الحساب أو تبدأ خطة تطوير (اللي بتاخد الأولوية وتوقف السلسلة دي مؤقتاً).
+    الحساب "شغّال" — كل نجاح بيستنى الوقت الحقيقي اللي اللعبة بتحدده (من
+    بروفايل محدّث) قبل ما يحاول تاني، وهكذا للأبد لحد ما توقف الحساب أو
+    تبدأ خطة تطوير (اللي بتاخد الأولوية وتوقف السلسلة دي مؤقتاً).
+    بنسجّل perk_next_at بالظبط عشان الواجهة تعرض عدّاد تنازلي حي زي اللعبة.
     """
     if not account.get("enabled"):
         db_execute("UPDATE accounts SET perk_next_at=NULL WHERE id=%s", (account["id"],))
@@ -883,21 +848,29 @@ def task_auto_perk(account, payload):
         queue_task(account["id"], "auto_perk", delay_seconds=e.retry_after)
         return None
 
+    progress = (account.get("perk_progress") or 0) + 1
     label = PERKS[perk]["label"]
+    message = f"تطوير {label} ({progress})"
 
     # نجيب بروفايل جديد — مرة واحدة بس — عشان (أ) نعرف الوقت الحقيقي للترقية
-    # الجاية (نفس عدّاد اللعبة) و(ب) نحدّث كل الأرقام المعروضة على طول
+    # الجاية و(ب) نحدّث كل الأرقام المعروضة (المستوى، مستويات المهارات...)
+    # على طول، بدل ما تفضل واقفة لحد "تحديث البيانات" اليدوي
     try:
-        profile = client.profile()
-        _apply_profile_snapshot(account["id"], account, profile)
-        wait_s = skill_cooldown_seconds(profile) or 65
+        fresh_profile = client.profile()
     except Exception:
+        fresh_profile = None
+
+    if fresh_profile:
+        _apply_profile_snapshot(account["id"], account, fresh_profile)
+        wait_s = skill_cooldown_seconds(fresh_profile) or 65
+    else:
         wait_s = 65
 
     next_at = now() + timedelta(seconds=wait_s)
-    db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s", (next_at, account["id"]))
+    db_execute("UPDATE accounts SET perk_progress=%s, perk_next_at=%s WHERE id=%s",
+              (progress, next_at, account["id"]))
     queue_task(account["id"], "auto_perk", delay_seconds=wait_s)
-    return f"تطوير {label}"
+    return message
 
 
 def task_quests(account, payload):
@@ -918,30 +891,12 @@ def task_quests(account, payload):
 
 
 def task_wheel(account, payload):
-    """
-    بيلف كل اللفات المجانية المتاحة دفعة واحدة (زي ملفك القديم بالظبط) —
-    مش لفة واحدة بس. لو اللعبة رجّعت رد غير متوقع (زي طلب تأكيد دفع)،
-    بنوقف على طول من غير ما نكمل — ده برّه نطاق اللف المجاني الأوتوماتيكي.
-    """
     client = client_for(account)
     state = client.wheel_state()
-    if not state.get("enabled") or state.get("locked"):
+    if not state.get("enabled") or (state.get("free_left") or 0) <= 0:
         return None
-
-    free_left = state.get("free_left") or 0
-    spun = 0
-    while free_left > 0:
-        try:
-            resp = client.spin_wheel()
-        except GameError:
-            break  # ممكن السيرفر يطلب تأكيد دفع أو أي حاجة برّه نطاق اللف المجاني
-        if not (isinstance(resp, dict) and resp.get("success")):
-            break
-        spun += 1
-        next_free = resp.get("free_left")
-        free_left = next_free if next_free is not None else free_left - 1
-
-    return f"لفّ العجلة المجانية {spun} مرة" if spun else None
+    client.spin_wheel()
+    return "لفّ العجلة المجانية"
 
 
 def task_work(account, payload):
@@ -1068,20 +1023,11 @@ def task_plan_step(account, payload):
     db_execute("UPDATE accounts SET upgrade_plan=%s::jsonb WHERE id=%s",
               (json.dumps(plan), account["id"]))
 
-    # نجيب بروفايل جديد — مرة واحدة بس — عشان (أ) نعرف الوقت الحقيقي للخطوة
-    # الجاية و(ب) نحدّث الأرقام المعروضة على طول بدل ما تفضل واقفة لحد
-    # "تحديث البيانات" اليدوي
+    # نجيب الوقت الحقيقي من بروفايل محدّث بدل ما نخمّن
     try:
-        fresh_profile = client.profile()
+        wait_s = skill_cooldown_seconds(client.profile()) or 65
     except Exception:
-        fresh_profile = None
-
-    if fresh_profile:
-        _apply_profile_snapshot(account["id"], account, fresh_profile)
-        wait_s = skill_cooldown_seconds(fresh_profile) or 65
-    else:
         wait_s = 65
-
     next_at = now() + timedelta(seconds=wait_s)
     db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s", (next_at, account["id"]))
     queue_task(account["id"], "plan_step", delay_seconds=wait_s)
@@ -1111,14 +1057,6 @@ KIND_LABELS = {
     "military_auto": "انضمام عسكري", "plan_step": "خطوة من خطة تطوير",
 }
 
-# الميزات دي "جانبية" — بتشتغل من نفسها كل شوية، وغالباً بترفض بسبب حد يومي
-# (زي "خلصت لفّات العجلة النهاردة") مش لأن التوكن فعلاً بايظ. رفض هنا مش لازم
-# يتحط كـ"توكن مرفوض" مخيف — كفاية نسجّله كملاحظة عادية ونكمل. الحساب الأساسي
-# (تحديث البيانات) والأوامر اللي إنت طلبتها بنفسك (سفر، فيزا، تطوير) لسه
-# بتتعامل مع رفض التوكن بجدّية زي ما هي
-_AMBIENT_KINDS = {"wheel", "quests", "work", "military_auto", "pills_auto",
-                  "auto_perk", "plan_step"}
-
 
 def run_task(task):
     account = get_account(task["account_id"])
@@ -1140,65 +1078,35 @@ def run_task(task):
         return
 
     title = account_title(account)
-    countdown_kinds = ("auto_perk", "plan_step")
-
-    def _bump_countdown(seconds):
-        """
-        العدّاد لازم يفضل صادق — لو مهمة تطوير فشلت لأي سبب، نحرّك ميعاد
-        المحاولة الجاية بدل ما نسيبه واقف على رقم قديم وهو فعلياً بيحاول
-        (ويفشل بصمت) في الخلفية كل شوية من غير ما يوضّح ده للمستخدم.
-        """
-        if task["kind"] in countdown_kinds:
-            db_execute("UPDATE accounts SET perk_next_at=%s WHERE id=%s",
-                      (now() + timedelta(seconds=seconds), account["id"]))
-
     try:
         message = handler(account, task["payload"] or {})
         db_execute(
             "UPDATE tasks SET status='done', result=%s, attempts=attempts+1 WHERE id=%s",
             ((message or "تم")[:300], task["id"]))
         mark_ok(account, f"{title}: {message}" if message else None)
-        if account.get("token_invalid"):
-            db_execute("UPDATE accounts SET token_invalid=FALSE WHERE id=%s", (account["id"],))
 
     except TokenInvalid as e:
         db_execute(
             "UPDATE tasks SET status='failed', result=%s, attempts=attempts+1 WHERE id=%s",
             (str(e), task["id"]))
         kind_label = KIND_LABELS.get(task["kind"], task["kind"])
-        if task["kind"] not in _AMBIENT_KINDS:
-            # مش توكن حقيقي بايظ غالباً في الميزات الجانبية (زي حد يومي خلص
-            # أو حماية اللعبة من كتر الطلبات) — منسجّلش أي حاجة ليها خالص،
-            # المهم إنها تفضل تشتغل جوه اللعبة مش إننا نوثّق كل رفضة
-            db_execute("UPDATE accounts SET token_invalid=TRUE WHERE id=%s", (account["id"],))
-            mark_error(account, f"{title}: التوكن مرفوض ({kind_label}) — جدّده من تعديل لو مستمر"
-                                " (الحساب فاضل شغّال والنبضة الجاية هتحاول تاني لوحدها)")
-        else:
-            # مفيش إعادة جدولة فورية هنا — النبضة الجاية (خلال دقيقتين) هي
-            # اللي هترجّع تحاول، فالعدّاد لازم يعكس الوقت ده بالظبط
-            _bump_countdown(TICK_SECONDS)
+        mark_error(account, f"{title}: التوكن مرفوض ({kind_label}) — جدّده من تعديل لو مستمر"
+                            " (الحساب فاضل شغّال والنبضة الجاية هتحاول تاني لوحدها)")
 
     except GameError as e:
         attempts = task["attempts"] + 1
-        is_ambient = task["kind"] in _AMBIENT_KINDS
         if attempts < 3:
-            retry_seconds = 300 * attempts
             db_execute("UPDATE tasks SET attempts=%s, run_at=%s, result=%s WHERE id=%s",
-                       (attempts, now() + timedelta(seconds=retry_seconds),
+                       (attempts, now() + timedelta(minutes=5 * attempts),
                         str(e)[:300], task["id"]))
-            _bump_countdown(retry_seconds)
-            if not is_ambient:
-                add_log(f"{title}: {e} — هنعيد المحاولة", "warn", account["id"])
+            add_log(f"{title}: {e} — هنعيد المحاولة", "warn", account["id"])
         else:
             db_execute("UPDATE tasks SET status='failed', attempts=%s, result=%s WHERE id=%s",
                        (attempts, str(e)[:300], task["id"]))
-            _bump_countdown(TICK_SECONDS)
-            if not is_ambient:
-                mark_error(account, f"{title}: {e}")
+            mark_error(account, f"{title}: {e}")
 
     except Exception as e:
         log.exception("خطأ غير متوقع في المهمة %s", task["id"])
-        _bump_countdown(TICK_SECONDS)
         db_execute(
             "UPDATE tasks SET status='failed', attempts=attempts+1, result=%s WHERE id=%s",
             (f"{type(e).__name__}: {e}"[:300], task["id"]))
@@ -1236,10 +1144,10 @@ def schedule_periodic():
         if not account.get("upgrade_plan") and _queue_if_free(aid, "auto_perk"):
             added += 1
 
-        if account.get("auto_quests") and _queue_if_free(aid, "quests", 480):
+        if account.get("auto_quests") and _queue_if_free(aid, "quests", 60):
             added += 1
 
-        if account.get("auto_wheel") and _queue_if_free(aid, "wheel", 480):
+        if account.get("auto_wheel") and _queue_if_free(aid, "wheel", 60):
             added += 1
 
         if account.get("auto_work"):
@@ -1617,13 +1525,11 @@ function notifyPerkChanges(oldAccounts, newAccounts) {
   const oldById = new Map(oldAccounts.map((a) => [a.id, a]));
   for (const a of newAccounts) {
     const before = oldById.get(a.id);
-    if (!before || before.perk !== a.perk) continue;
+    if (!before) continue;
 
-    const oldLevel = currentSkillLevel(before, a.perk);
-    const newLevel = currentSkillLevel(a, a.perk);
-    if (oldLevel !== null && newLevel !== null && newLevel > oldLevel) {
+    if (before.perk === a.perk && a.perk_progress > before.perk_progress) {
       const label = window.PERKS[a.perk]?.label || a.perk;
-      toast(`✅ ${a.label || a.game_name || 'حساب'}: اتطوّرت ${label} (${oldLevel} → ${newLevel})`);
+      toast(`✅ ${a.label || a.game_name || 'حساب'}: اتطوّرت ${label} (${a.perk_progress})`);
     }
   }
 }
@@ -1738,7 +1644,6 @@ function cardHtml(a) {
       </div>
       <div class="card-title">
         <h3>${esc(a.label || a.game_name || 'حساب جديد')}</h3>
-        ${a.token_invalid ? '<span class="chip bad" style="margin-inline-start:6px">🔒 توكن منتهي</span>' : ''}
         <div class="sub">
           ${a.game_name ? esc(a.game_name) : 'لسه مجابش بيانات'}
           <span class="squad-tag">${esc(a.squad)}</span>
@@ -1935,25 +1840,18 @@ async function saveAccount() {
 
   if (!id && !token) return toast('الصق التوكن الأول', true);
 
-  const saveBtn = $('acc-save');
-  const originalText = saveBtn ? saveBtn.textContent : '';
-  if (saveBtn && token) { saveBtn.disabled = true; saveBtn.textContent = 'بنجيب بياناته…'; }
-
   try {
     if (id) {
       await api(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
-      toast(token ? 'اتحفظ — البيانات جاهزة' : 'التعديلات اتحفظت');
+      toast('التعديلات اتحفظت');
     } else {
       await api('/api/accounts', { method: 'POST', body: JSON.stringify(payload) });
-      toast('الحساب اتضاف والبيانات جاهزة');
+      toast('الحساب اتضاف — بنجيب بياناته دلوقتي');
     }
     closeModals();
     await loadState();
-  } catch (e) {
-    toast(e.message, true);
-  } finally {
-    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = originalText; }
-  }
+    if (!id) setTimeout(loadState, 3000);  // نلحق تحديث البيانات لما تجي
+  } catch (e) { toast(e.message, true); }
 }
 
 async function openProxyModal(id) {
@@ -2575,7 +2473,6 @@ app.config.update(
     SECRET_KEY=SECRET_KEY,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=True,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 30,
 )
 # من غير السطرين دول المفاتيح بتتّرتب أبجدياً، فترتيب القوايم في الواجهة بيتقلب
@@ -2674,7 +2571,7 @@ def dashboard():
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({"ok": True, "service": "game-bot-panel"})
+    return jsonify({"ok": True, "service": "mikael-bot"})
 
 
 # ── الحالة ───────────────────────────────────────────────
@@ -2709,7 +2606,6 @@ def _public_account(row):
         "perk": row["perk"], "currency": row["currency"],
         "perk_progress": row["perk_progress"],
         "perk_next_at": row["perk_next_at"].isoformat() if row["perk_next_at"] else None,
-        "token_invalid": row["token_invalid"],
         "auto_quests": row["auto_quests"],
         "auto_wheel": row["auto_wheel"], "auto_work": row["auto_work"],
         "auto_pills": row["auto_pills"], "pills_limit": row["pills_limit"],
@@ -2782,10 +2678,9 @@ def api_create_account():
         "VALUES (%s,%s,%s,(SELECT COALESCE(MAX(sort_order),0)+1 FROM accounts)) RETURNING id",
         (label, token, (data.get("squad") or "المجموعة الأولى").strip()), returning=True)
     add_log(f"اتضاف حساب جديد {('— ' + label) if label else ''}", "ok", row["id"])
-
-    # نجيب بياناته فوراً جوه نفس الطلب — عشان تظهر جاهزة أول ما المودال يقفل
-    _sync_refresh(get_account(row["id"]))
-
+    queue_task(row["id"], "refresh")
+    # منستناش النبضة الجاية — نجيب البيانات فوراً
+    threading.Thread(target=run_tick, args=("account_added",), daemon=True).start()
     return jsonify({"ok": True, "id": row["id"]})
 
 
@@ -2862,26 +2757,14 @@ def api_update_account(account_id):
     db_execute(f"UPDATE accounts SET {', '.join(sets)} WHERE id=%s", params)
 
     if data.get("token"):
-        db_execute("UPDATE accounts SET status='idle', last_error='', token_invalid=FALSE WHERE id=%s",
-                  (account_id,))
-        _sync_refresh(get_account(account_id))
+        db_execute("UPDATE accounts SET status='idle', last_error='' WHERE id=%s", (account_id,))
+        queue_task(account_id, "refresh")
+        threading.Thread(target=run_tick, args=("token_updated",), daemon=True).start()
 
     # لو الحساب اتشغّل دلوقتي، منستناش النبضة الجاية — نبدأ سلسلة التطوير
     # (وأي ميزة تانية مفعّلة) على طول عشان العدّاد يظهر فوراً
     if data.get("enabled") and not account["enabled"]:
         threading.Thread(target=run_tick, args=("account_enabled",), daemon=True).start()
-
-    # لو المهارة اتغيّرت يدوي والحساب شغّال من غير خطة تطوير، منستناش لحد
-    # النبضة الجاية — نلغي أي مهمة منتظرة على المهارة القديمة، ونبدأ فوراً
-    # على المهارة الجديدة (لو فيه ترقية شغّالة بالفعل جوّه اللعبة، اللعبة
-    # هترفض بـ"فيه ترقية شغّالة" وده بيتعامل معاه عادي زي أي رفض تاني)
-    if ("perk" in data and data.get("perk") != account["perk"]
-            and account["enabled"] and not account.get("upgrade_plan")):
-        db_execute(
-            "DELETE FROM tasks WHERE account_id=%s AND kind='auto_perk' AND status='pending'",
-            (account_id,))
-        queue_task(account_id, "auto_perk")
-        threading.Thread(target=run_tick, args=("perk_switched",), daemon=True).start()
 
     return jsonify({"ok": True})
 
